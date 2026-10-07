@@ -1,0 +1,2309 @@
+From 677da5778a508cb5fe532bf67eef8737b317d5d8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 21:10:11 +0000
+Subject: [PATCH 2/3] =?UTF-8?q?parametric:=20sketcher=20UI=20=E2=80=94=20c?=
+ =?UTF-8?q?anvas=20(zoom/pan/fit/snap),=20tool=20rail,=20properties/constr?=
+ =?UTF-8?q?aints/relations/layers/roof=20panels,=20preview=20+=20conflict?=
+ =?UTF-8?q?=20banner?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/parametric/doc.ts                    |   4 +
+ src/parametric/ui/ParametricSketcher.tsx | 983 +++++++++++++++++++++++
+ src/parametric/ui/SketchCanvas.tsx       | 605 ++++++++++++++
+ src/parametric/ui/camera.ts              |  51 ++
+ src/parametric/ui/hit.ts                 |  82 ++
+ src/parametric/ui/panels.tsx             | 386 +++++++++
+ src/parametric/ui/snap.ts                | 114 +++
+ 7 files changed, 2225 insertions(+)
+ create mode 100644 src/parametric/ui/ParametricSketcher.tsx
+ create mode 100644 src/parametric/ui/SketchCanvas.tsx
+ create mode 100644 src/parametric/ui/camera.ts
+ create mode 100644 src/parametric/ui/hit.ts
+ create mode 100644 src/parametric/ui/panels.tsx
+ create mode 100644 src/parametric/ui/snap.ts
+
+diff --git a/src/parametric/doc.ts b/src/parametric/doc.ts
+index 8bd1306..5678577 100644
+--- a/src/parametric/doc.ts
++++ b/src/parametric/doc.ts
+@@ -106,6 +106,8 @@ export type ObjectSpec =
+ 
+ export type SketchAction =
+   | { kind: 'replaceDoc'; doc: SketchDoc }
++  /** Commit an already-settled doc (a confirmed preview) verbatim. */
++  | { kind: 'commitDoc'; doc: SketchDoc }
+   | { kind: 'addPoint'; at: Pt }
+   | {
+       kind: 'addLine'
+@@ -302,6 +304,8 @@ export function sketchReducer(doc: SketchDoc, a: SketchAction): SketchDoc {
+   switch (a.kind) {
+     case 'replaceDoc':
+       return settle(a.doc).doc
++    case 'commitDoc':
++      return a.doc
+     case 'addPoint': {
+       const r = resolvePoint(doc, a.at)
+       return r.doc
+diff --git a/src/parametric/ui/ParametricSketcher.tsx b/src/parametric/ui/ParametricSketcher.tsx
+new file mode 100644
+index 0000000..ff97fb1
+--- /dev/null
++++ b/src/parametric/ui/ParametricSketcher.tsx
+@@ -0,0 +1,983 @@
++// src/parametric/ui/ParametricSketcher.tsx
++// THE PARAMETRIC SKETCHING ENVIRONMENT (owner brief 2026-10-07). A fixed,
++// full-screen workspace (brief §5: large canvas, no page scroll; wheel =
++// zoom about the cursor, middle button / hand = pan, zoom-to-fit, snapping,
++// undo/redo, compact properties panel, layer visibility + lock).
++//
++// Orchestrates the pure core (../doc.ts reducer wrapped by the roofwizard's
++// generic undo ring) and the canvas/panels. Every edit that can move other
++// objects (a dimension value, a relation value, a thickness) first shows a
++// PREVIEW ghost + the list of affected objects, then commits on confirm
++// (brief §4). A contradiction is never resolved by the app: the offending
++// constraint stays, highlighted, until the user edits or deletes it.
++import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
++import {
++  Columns3,
++  Crosshair,
++  DoorOpen,
++  Grid2x2,
++  Hand,
++  House,
++  Maximize2,
++  Minus,
++  MousePointer2,
++  PenLine,
++  Plus,
++  Redo2,
++  Ruler,
++  Slash,
++  Square,
++  SquareDashed,
++  Trash2,
++  Undo2,
++  X,
++} from 'lucide-react'
++import { initHistory, undoable, type HistoryAction } from '../../roofwizard/history'
++import { useLengthUnit } from '../../roofwizard/unitContext'
++import { formatLength, interpretInUnit } from '../../roofwizard/units'
++import { evaluate, measureDimension, movedObjects, sketchReducer, type ObjectSpec, type SketchAction } from '../doc'
++import {
++  CONSTRAINT_LABEL_HE,
++  OBJECT_LABEL_HE,
++  RELATION_LABEL_HE,
++  constraintRefs,
++  lineById,
++  objectById,
++  pointById,
++  relationRefs,
++  type Dimension,
++  type Pt,
++  type RelationKind,
++  type SketchDoc,
++  type SketchObject,
++  type StructuralRelation,
++} from '../model'
++import { bounds, signedDist, sub } from '../geom'
++import { offsetOf } from '../objects'
++import { deriveRoof, type RoofDerivation } from '../roofBridge'
++import { fitTo, zoomAt, type Camera } from './camera'
++import { snapPoint, type Snap } from './snap'
++import { SketchCanvas, type CanvasPointer, type Draft, type PreviewGhost } from './SketchCanvas'
++import { ConstraintList, LayersPanel, ObjectProperties, ReferenceDimensionList, RelationList, RoofPanel, chipCls, chipOn, panelCls } from './panels'
++
++export type Tool = 'select' | 'pan' | 'line' | 'wallExt' | 'wallInt' | 'beam' | 'aux' | 'roofEdge' | 'column' | 'opening' | 'dimension'
++
++const TOOLS: { id: Tool; he: string; icon: typeof PenLine; hint: string }[] = [
++  { id: 'select', he: 'בחירה', icon: MousePointer2, hint: 'לחיצה בוחרת · גרירה מזיזה (לפי היחסים) · Shift לבחירה מרובה' },
++  { id: 'pan', he: 'יד', icon: Hand, hint: 'גרירה מזיזה את התצוגה · גלגלת = Zoom סביב הסמן' },
++  { id: 'line', he: 'קו', icon: PenLine, hint: 'לחיצה ראשונה = התחלה · לחיצה שנייה = סוף · אפשר להקליד אורך ו-Enter · Esc מסיים' },
++  { id: 'wallExt', he: 'קיר חוץ', icon: Square, hint: 'שרטט את קו הקיר (מרכז/פן — ניתן לשנות בפאנל). סגור את הלולאה כדי שהגג ייבנה' },
++  { id: 'wallInt', he: 'קיר פנים', icon: SquareDashed, hint: 'שרטט את קו הקיר הפנימי' },
++  { id: 'column', he: 'עמוד', icon: Columns3, hint: 'לחיצה ממקמת עמוד (נצמד לנקודות קיימות)' },
++  { id: 'beam', he: 'קורה', icon: Minus, hint: 'שרטט את ציר הקורה בין שתי תמיכות' },
++  { id: 'opening', he: 'פתח', icon: DoorOpen, hint: 'לחיצה על קיר ממקמת פתח' },
++  { id: 'roofEdge', he: 'קצה גג', icon: House, hint: 'שרטט קו קצה גג / גבול מפתח' },
++  { id: 'aux', he: 'קו עזר', icon: Slash, hint: 'קו עזר / ציר — לא חלק מהמבנה' },
++  { id: 'dimension', he: 'מידה', icon: Ruler, hint: 'קו = אורך · נקודה+נקודה = מרחק · נקודה+קו = מרחק מקו · קו+קו = זווית/מרחק' },
++]
++
++const SNAP_PX = 10
++const GRID_M = 0.05
++
++interface PickFlow {
++  relation: RelationKind
++  /** The object the flow was started from (selected). */
++  subject: string
++  /** Extra selection (divide: the columns). */
++  subjects: string[]
++  steps: { want: 'wall' | 'extWall' | 'lineObject' | 'support' | 'point' | 'reference'; hint: string }[]
++  collected: string[]
++}
++
++interface Pending {
++  next: SketchDoc
++  affected: string[]
++  label: string
++}
++
++interface DragState {
++  pointIds: string[]
++  startWorld: Pt
++  start: Map<string, Pt>
++  moved: boolean
++}
++
++const reducer = undoable<SketchDoc, SketchAction>(sketchReducer)
++
++export interface ParametricSketcherProps {
++  initialDoc: SketchDoc
++  /** Autosave hook — every committed change (debounced). */
++  onChange?: (doc: SketchDoc) => void
++  onClose: () => void
++  /** Build / update the roof from the sketch (brief §6). */
++  onBuildRoof?: (r: { doc: SketchDoc; derivation: RoofDerivation }) => void
++  initialSlopePct?: number
++  title?: string
++  /** True when a roof already exists on the block (button reads "עדכן"). */
++  roofExists?: boolean
++}
++
++export function ParametricSketcher({ initialDoc, onChange, onClose, onBuildRoof, initialSlopePct, title, roofExists }: ParametricSketcherProps) {
++  const unit = useLengthUnit()
++  const [hist, rawDispatch] = useReducer(reducer, initialDoc, (d) => initHistory(d))
++  const doc = hist.present
++  const dispatch = useCallback((a: HistoryAction<SketchAction>) => rawDispatch(a), [])
++
++  const [tool, setTool] = useState<Tool>('select')
++  const [selection, setSelection] = useState<ReadonlySet<string>>(new Set())
++  const [selectedConstraint, setSelectedConstraint] = useState<string | null>(null)
++  const [camera, setCamera] = useState<Camera>({ cx: 5, cy: 3, pxPerM: 60 })
++  const sizeRef = useRef({ w: 800, h: 600 })
++  const [showGrid, setShowGrid] = useState(true)
++  const [snapOn, setSnapOn] = useState(true)
++  const [hover, setHover] = useState<Snap | null>(null)
++  const [draftStart, setDraftStart] = useState<Snap | null>(null)
++  const [typed, setTyped] = useState('')
++  const dragRef = useRef<DragState | null>(null)
++  const [pending, setPending] = useState<Pending | null>(null)
++  const [pick, setPick] = useState<PickFlow | null>(null)
++  const [dimRefs, setDimRefs] = useState<{ id: string; type: 'point' | 'line' }[]>([])
++  const [message, setMessage] = useState<string | null>(null)
++  const [slopePct, setSlopePct] = useState(initialSlopePct ?? doc.roofSlopePct ?? 40)
++  const fittedRef = useRef(false)
++
++  const ev = useMemo(() => evaluate(doc), [doc])
++  const derivation = useMemo(() => deriveRoof(doc), [doc])
++  const positions = useMemo(() => {
++    const m = new Map<string, Pt>()
++    for (const p of doc.points) m.set(p.id, { x: p.x, y: p.y })
++    return m
++  }, [doc])
++
++  // Autosave (debounced) — brief §4 "לשמור … גם לאחר סגירה ופתיחה מחדש".
++  const onChangeRef = useRef(onChange)
++  onChangeRef.current = onChange
++  const first = useRef(true)
++  useEffect(() => {
++    if (first.current) {
++      first.current = false
++      return
++    }
++    const t = setTimeout(() => onChangeRef.current?.(doc), 300)
++    return () => clearTimeout(t)
++  }, [doc])
++
++  // Fit once when the canvas has a size and the doc has geometry.
++  const fit = useCallback(() => {
++    const { w, h } = sizeRef.current
++    const pts = doc.points.length > 0 ? doc.points : [{ x: 0, y: 0 }, { x: 10, y: 6 }]
++    setCamera(fitTo(bounds(pts), w, h))
++  }, [doc.points])
++  const onSize = useCallback((w: number, h: number) => {
++    sizeRef.current = { w, h }
++    if (!fittedRef.current) {
++      fittedRef.current = true
++      const pts = initialDoc.points.length > 0 ? initialDoc.points : [{ x: 0, y: 0 }, { x: 10, y: 6 }]
++      setCamera(fitTo(bounds(pts), w, h))
++    }
++  }, [initialDoc.points])
++
++  // ---------------------------------------------------------------------
++  // helpers
++  // ---------------------------------------------------------------------
++  const geometryOf = (id: string): { type: 'point' | 'line'; id: string } | null => {
++    if (pointById(doc, id)) return { type: 'point', id }
++    if (lineById(doc, id)) return { type: 'line', id }
++    const o = objectById(doc, id)
++    if (!o) return null
++    if (o.kind === 'column') return { type: 'point', id: o.point }
++    if ('line' in o) return { type: 'line', id: o.line }
++    return null
++  }
++  const selectedObjects = [...selection].map((id) => objectById(doc, id)).filter((o): o is SketchObject => !!o)
++  const selGeom = [...selection].map(geometryOf).filter((g): g is { type: 'point' | 'line'; id: string } => !!g)
++  const selPoints = selGeom.filter((g) => g.type === 'point').map((g) => g.id)
++  const selLines = selGeom.filter((g) => g.type === 'line').map((g) => g.id)
++  const selGeomIds = new Set(selGeom.map((g) => g.id))
++
++  const constraintsOfSelection = doc.constraints.filter((c) => constraintRefs(c).some((r) => selGeomIds.has(r))).map((c) => c.id)
++  const relationsOfSelection = doc.relations.filter((r) => relationRefs(r).some((id) => selection.has(id)))
++  const refDimsOfSelection = doc.dimensions.filter((d) => !d.driving && d.refs.some((r) => selGeomIds.has(r)))
++
++  const say = (m: string | null) => setMessage(m)
++
++  const doSnap = (world: Pt, anchor?: Pt, exclude?: ReadonlySet<string>): Snap => {
++    const hiddenLines = new Set<string>()
++    for (const o of doc.objects) {
++      const visible = !o.hidden && doc.layers[o.kind === 'wall' ? (o.wallType === 'exterior' ? 'wallExt' : 'wallInt') : o.kind === 'column' ? 'column' : o.kind === 'beam' ? 'beam' : o.kind === 'opening' ? 'opening' : o.kind === 'aux' ? 'aux' : 'roof'].visible
++      if (visible) continue
++      if ('line' in o) hiddenLines.add(o.line)
++    }
++    if (!snapOn) return { point: world, kind: 'free' }
++    return snapPoint(doc, positions, world, { radiusM: SNAP_PX / camera.pxPerM, gridM: showGrid ? GRID_M : null, anchor, exclude, hiddenLines })
++  }
++
++  /** Run an action through a preview when it moves other objects. */
++  const withPreview = (action: SketchAction, label: string, directly: string[]) => {
++    const next = sketchReducer(doc, action)
++    if (next === doc) return
++    const affected = movedObjects(doc, next).filter((id) => !directly.includes(id))
++    if (affected.length === 0) {
++      dispatch(action)
++      return
++    }
++    setPending({ next, affected, label })
++  }
++  const confirmPending = () => {
++    if (!pending) return
++    dispatch({ kind: 'commitDoc', doc: pending.next })
++    setPending(null)
++  }
++
++  const cancelAll = () => {
++    setDraftStart(null)
++    setTyped('')
++    setPick(null)
++    setDimRefs([])
++    setPending(null)
++    setHover(null)
++    say(null)
++  }
++
++  const objectSpecFor = (t: Tool): ObjectSpec | undefined => {
++    switch (t) {
++      case 'wallExt': return { kind: 'wall', wallType: 'exterior' }
++      case 'wallInt': return { kind: 'wall', wallType: 'interior' }
++      case 'beam': return { kind: 'beam' }
++      case 'aux': return { kind: 'aux', auxType: 'guide' }
++      case 'roofEdge': return { kind: 'roofEdge', edgeType: 'eave' }
++      default: return undefined
++    }
++  }
++  const isLineTool = tool === 'line' || tool === 'wallExt' || tool === 'wallInt' || tool === 'beam' || tool === 'aux' || tool === 'roofEdge'
++
++  // ---------------------------------------------------------------------
++  // pointer handling
++  // ---------------------------------------------------------------------
++  const commitLine = (end: Snap) => {
++    if (!draftStart) return
++    const a = draftStart.pointId ? { pointId: draftStart.pointId } : draftStart.point
++    const b = end.pointId ? { pointId: end.pointId } : end.point
++    const d = sub(end.point, draftStart.point)
++    if (Math.hypot(d.x, d.y) < 1e-6) return
++    const auto: ('horizontal' | 'vertical')[] = []
++    const ang = Math.abs((Math.atan2(d.y, d.x) * 180) / Math.PI)
++    if (end.axis === 'horizontal' || ang < 1.5 || ang > 178.5) auto.push('horizontal')
++    else if (end.axis === 'vertical' || Math.abs(ang - 90) < 1.5) auto.push('vertical')
++    dispatch({ kind: 'addLine', a, b, auto, as: objectSpecFor(tool), construction: tool === 'aux' })
++    // Chain: the next line starts where this one ended.
++    setDraftStart({ point: end.point, kind: end.kind, pointId: end.pointId })
++    setTyped('')
++  }
++
++  const handlePickClick = (p: CanvasPointer): boolean => {
++    if (!pick) return false
++    const step = pick.steps[pick.collected.length]
++    if (!step) return false
++    const hit = p.hit
++    let id: string | null = null
++    if (step.want === 'point') {
++      if (hit?.type === 'point') id = hit.id
++      else if (hit?.type === 'object' && hit.object.kind === 'column') id = hit.object.point
++    } else if (hit?.type === 'object') {
++      const o = hit.object
++      if (step.want === 'wall' && o.kind === 'wall') id = o.id
++      if (step.want === 'extWall' && o.kind === 'wall' && o.wallType === 'exterior') id = o.id
++      if (step.want === 'lineObject' && 'line' in o) id = o.id
++      if (step.want === 'support' && (o.kind === 'column' || o.kind === 'wall' || o.kind === 'beam')) id = o.id
++      if (step.want === 'reference' && (o.kind === 'wall' || o.kind === 'beam')) id = o.id
++    }
++    if (!id) {
++      say('בחר ' + step.hint)
++      return true
++    }
++    const collected = [...pick.collected, id]
++    if (collected.length < pick.steps.length) {
++      setPick({ ...pick, collected })
++      say(pick.steps[collected.length]!.hint)
++      return true
++    }
++    finishPick({ ...pick, collected })
++    return true
++  }
++
++  const finishPick = (f: PickFlow) => {
++    const subject = objectById(doc, f.subject)
++    if (!subject) {
++      setPick(null)
++      return
++    }
++    let relation: StructuralRelation | null = null
++    const measuredFromWall = (targetId: string, wallId: string, ref: 'center' | 'faceA' | 'faceB'): number => {
++      const wall = objectById(doc, wallId)
++      const t = objectById(doc, targetId)
++      if (!wall || wall.kind !== 'wall' || !t) return 0
++      const wl = lineById(doc, wall.line)
++      if (!wl) return 0
++      const a = positions.get(wl.a)!
++      const b = positions.get(wl.b)!
++      const pt = t.kind === 'column' ? positions.get(t.point) : 'line' in t ? midOfLine(t.line) : null
++      if (!pt) return 0
++      return signedDist(pt, a, b) - offsetOf(wall, ref)
++    }
++    const midOfLine = (lineId: string): Pt | null => {
++      const l = lineById(doc, lineId)
++      if (!l) return null
++      const a = positions.get(l.a)!
++      const b = positions.get(l.b)!
++      return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
++    }
++    switch (f.relation) {
++      case 'columnOnAxis':
++        relation = { id: '', kind: 'columnOnAxis', column: f.subject, line: f.collected[0]! }
++        break
++      case 'columnAtCorner':
++        relation = {
++          id: '',
++          kind: 'columnAtCorner',
++          column: f.subject,
++          wallA: f.collected[0]!,
++          wallB: f.collected[1]!,
++          refA: 'center',
++          refB: 'center',
++          distA: measuredFromWall(f.subject, f.collected[0]!, 'center'),
++          distB: measuredFromWall(f.subject, f.collected[1]!, 'center'),
++        }
++        break
++      case 'offsetFromWall':
++        relation = { id: '', kind: 'offsetFromWall', target: f.subject, wall: f.collected[0]!, ref: 'center', distM: measuredFromWall(f.subject, f.collected[0]!, 'center') }
++        break
++      case 'beamBetween':
++        relation = { id: '', kind: 'beamBetween', beam: f.subject, supportA: f.collected[0]!, supportB: f.collected[1]! }
++        break
++      case 'alignTo': {
++        const ref = objectById(doc, f.collected[0]!)
++        const t = subject
++        const rl = ref && 'line' in ref ? lineById(doc, ref.line) : null
++        const tm = 'line' in t ? midOfLine(t.line) : null
++        let gap = 0
++        if (rl && tm && ref) gap = signedDist(tm, positions.get(rl.a)!, positions.get(rl.b)!) - offsetOf(ref, 'center') + offsetOf(t, 'center')
++        relation = { id: '', kind: 'alignTo', target: f.subject, reference: f.collected[0]!, ref: 'center', gapM: gap }
++        break
++      }
++      case 'divide':
++        relation = { id: '', kind: 'divide', columns: f.subjects, boundA: f.collected[0]!, boundB: f.collected[1]!, by: 'count' }
++        break
++      case 'roofOverhang': {
++        const wall = objectById(doc, f.collected[0]!)
++        let over = 0.5
++        if (wall && wall.kind === 'wall' && 'line' in subject) {
++          const wl = lineById(doc, wall.line)!
++          const tm = midOfLine(subject.line)!
++          const sd = signedDist(tm, positions.get(wl.a)!, positions.get(wl.b)!)
++          over = Math.max(0, Math.abs(sd) - wall.thicknessM / 2 - Math.abs(offsetOf(wall, 'center')))
++        }
++        relation = { id: '', kind: 'roofOverhang', roofEdge: f.subject, wall: f.collected[0]!, overhangM: over }
++        break
++      }
++    }
++    setPick(null)
++    if (!relation) return
++    const { id: _drop, ...rest } = relation
++    void _drop
++    const action: SketchAction = { kind: 'addRelation', relation: rest as never }
++    const next = sketchReducer(doc, action)
++    if (next === doc) {
++      say('לא ניתן היה להוסיף את היחס')
++      return
++    }
++    dispatch(action)
++    const after = evaluate(next)
++    say(after.solved.ok ? `נוסף: ${RELATION_LABEL_HE[relation.kind]}` : 'היחס נוסף אבל סותר יחסים קיימים — ראה הדגשה באדום')
++  }
++
++  const onDown = (p: CanvasPointer) => {
++    if (pending) return
++    if (p.button === 2) {
++      // right click: finish the chain / cancel the flow
++      cancelAll()
++      return
++    }
++    if (p.button !== 0) return
++    if (pick) {
++      handlePickClick(p)
++      return
++    }
++    if (isLineTool) {
++      const s = doSnap(p.world, draftStart?.point)
++      if (!draftStart) {
++        setDraftStart(s)
++        say(TOOLS.find((t) => t.id === tool)!.hint)
++      } else commitLine(s)
++      return
++    }
++    if (tool === 'column') {
++      const s = doSnap(p.world)
++      dispatch({ kind: 'addColumn', at: s.pointId ? { pointId: s.pointId } : s.point })
++      return
++    }
++    if (tool === 'opening') {
++      if (p.hit?.type === 'object' && p.hit.object.kind === 'wall') {
++        const wall = p.hit.object
++        const l = lineById(doc, wall.line)!
++        const a = positions.get(l.a)!
++        const b = positions.get(l.b)!
++        const d = sub(b, a)
++        const len = Math.hypot(d.x, d.y)
++        const t = ((p.world.x - a.x) * d.x + (p.world.y - a.y) * d.y) / (len * len)
++        dispatch({ kind: 'addOpening', wall: wall.id, offsetM: Math.max(0.5, Math.min(len - 0.5, t * len)) })
++      } else say('לחץ על קיר כדי להוסיף פתח')
++      return
++    }
++    if (tool === 'dimension') {
++      handleDimensionClick(p)
++      return
++    }
++    // select tool
++    const hit = p.hit
++    if (!hit) {
++      if (!p.shift) {
++        setSelection(new Set())
++        setSelectedConstraint(null)
++      }
++      return
++    }
++    const id = hit.type === 'object' ? hit.object.id : hit.id
++    const next = new Set(p.shift ? selection : [])
++    if (p.shift && next.has(id)) next.delete(id)
++    else next.add(id)
++    setSelection(next)
++    setSelectedConstraint(null)
++    // start a drag on the hit geometry (if not locked)
++    const pointIds = new Set<string>()
++    for (const sid of next) {
++      const o = objectById(doc, sid)
++      if (o) {
++        if (o.locked || doc.layers[o.kind === 'wall' ? (o.wallType === 'exterior' ? 'wallExt' : 'wallInt') : o.kind === 'column' ? 'column' : o.kind === 'beam' ? 'beam' : o.kind === 'opening' ? 'opening' : o.kind === 'aux' ? 'aux' : 'roof'].locked) continue
++        if (o.kind === 'column') pointIds.add(o.point)
++        else if ('line' in o) {
++          const l = lineById(doc, o.line)
++          if (l) {
++            pointIds.add(l.a)
++            pointIds.add(l.b)
++          }
++        }
++      } else if (lineById(doc, sid)) {
++        const l = lineById(doc, sid)!
++        pointIds.add(l.a)
++        pointIds.add(l.b)
++      } else if (pointById(doc, sid)) pointIds.add(sid)
++    }
++    if (pointIds.size > 0) {
++      const start = new Map<string, Pt>()
++      for (const pid of pointIds) start.set(pid, positions.get(pid)!)
++      dragRef.current = { pointIds: [...pointIds], startWorld: p.world, start, moved: false }
++    }
++  }
++
++  const onMove = (p: CanvasPointer) => {
++    const drag = dragRef.current
++    if (drag) {
++      const dx = p.world.x - drag.startWorld.x
++      const dy = p.world.y - drag.startWorld.y
++      if (!drag.moved) {
++        if (Math.hypot(dx, dy) * camera.pxPerM < 3) return
++        drag.moved = true
++        dispatch({ kind: 'gestureStart' })
++      }
++      const targets: Record<string, Pt> = {}
++      // Single point: snap it; a whole object: translate rigidly.
++      if (drag.pointIds.length === 1) {
++        const s = doSnap(p.world, undefined, new Set(drag.pointIds))
++        targets[drag.pointIds[0]!] = s.point
++        setHover(s)
++      } else {
++        for (const pid of drag.pointIds) {
++          const s0 = drag.start.get(pid)!
++          targets[pid] = { x: s0.x + dx, y: s0.y + dy }
++        }
++      }
++      dispatch({ kind: 'movePoints', targets })
++      return
++    }
++    if (isLineTool || tool === 'column' || tool === 'dimension' || pick) {
++      setHover(doSnap(p.world, draftStart?.point))
++    } else if (hover) setHover(null)
++  }
++
++  const onUp = () => {
++    const drag = dragRef.current
++    if (drag) {
++      dragRef.current = null
++      if (drag.moved) {
++        dispatch({ kind: 'gestureEnd' })
++        setHover(null)
++        if (!evaluate(doc).solved.ok) say('הגרירה הוגבלה על ידי היחסים — נקודה מוגדרת במלואה לא זזה')
++      }
++    }
++  }
++
++  const handleDimensionClick = (p: CanvasPointer) => {
++    const hit = p.hit
++    const ref = hit ? (hit.type === 'point' ? { id: hit.id, type: 'point' as const } : hit.type === 'line' ? { id: hit.id, type: 'line' as const } : hit.object.kind === 'column' ? { id: hit.object.point, type: 'point' as const } : 'line' in hit.object ? { id: hit.object.line, type: 'line' as const } : null) : null
++    const addDim = (dim: Omit<Dimension, 'id' | 'constraintId'>) => {
++      const value = measureDimension(doc, dim)
++      if (value === null) return
++      dispatch({ kind: 'addDimension', dim, value: dim.kind === 'angle' ? value : Math.abs(value) < 1e-9 ? 0 : value })
++      setDimRefs([])
++      say('נוספה מידה מניעה — ערוך את הערך בפאנל או בלחיצה על המידה')
++    }
++    if (dimRefs.length === 0) {
++      if (!ref) return
++      setDimRefs([ref])
++      say(ref.type === 'line' ? 'לחץ שוב על ריק = אורך · על נקודה = מרחק מקו · על קו = זווית/מרחק' : 'לחץ על נקודה שנייה = מרחק · על קו = מרחק מקו')
++      return
++    }
++    const first = dimRefs[0]!
++    if (!ref) {
++      if (first.type === 'line') addDim({ kind: 'length', refs: [first.id], driving: true })
++      else setDimRefs([])
++      return
++    }
++    if (ref.id === first.id) {
++      if (first.type === 'line') addDim({ kind: 'length', refs: [first.id], driving: true })
++      return
++    }
++    if (first.type === 'point' && ref.type === 'point') addDim({ kind: 'pointDistance', refs: [first.id, ref.id], driving: true })
++    else if (first.type === 'point' && ref.type === 'line') addDim({ kind: 'pointLineDistance', refs: [first.id, ref.id], driving: true })
++    else if (first.type === 'line' && ref.type === 'point') addDim({ kind: 'pointLineDistance', refs: [ref.id, first.id], driving: true })
++    else {
++      const ang = measureDimension(doc, { kind: 'angle', refs: [first.id, ref.id] }) ?? 0
++      const parallel = Math.abs(ang) < 0.5 || Math.abs(Math.abs(ang) - 180) < 0.5
++      addDim(parallel ? { kind: 'lineDistance', refs: [first.id, ref.id], driving: true } : { kind: 'angle', refs: [first.id, ref.id], driving: true })
++    }
++  }
++
++  // ---------------------------------------------------------------------
++  // keyboard
++  // ---------------------------------------------------------------------
++  useEffect(() => {
++    const onKey = (e: KeyboardEvent) => {
++      const target = e.target as HTMLElement | null
++      if (target && (target.tagName === 'INPUT' || target.tagName === 'SELECT' || target.tagName === 'TEXTAREA')) return
++      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
++        e.preventDefault()
++        dispatch({ kind: e.shiftKey ? 'redo' : 'undo' })
++        return
++      }
++      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
++        e.preventDefault()
++        dispatch({ kind: 'redo' })
++        return
++      }
++      if (e.key === 'Escape') {
++        if (pending) setPending(null)
++        else if (draftStart || pick || dimRefs.length > 0) cancelAll()
++        else {
++          setSelection(new Set())
++          setSelectedConstraint(null)
++        }
++        return
++      }
++      if (e.key === 'Delete' || e.key === 'Backspace') {
++        if (draftStart && typed.length > 0 && e.key === 'Backspace') {
++          setTyped((t) => t.slice(0, -1))
++          return
++        }
++        if (selectedConstraint) {
++          dispatch({ kind: 'removeConstraint', id: selectedConstraint })
++          setSelectedConstraint(null)
++          return
++        }
++        if (selection.size > 0) {
++          for (const id of selection) {
++            if (objectById(doc, id)) dispatch({ kind: 'removeObject', id })
++            else if (lineById(doc, id)) dispatch({ kind: 'deleteLines', ids: [id] })
++          }
++          setSelection(new Set())
++        }
++        return
++      }
++      if (draftStart) {
++        if (/^[0-9.]$/.test(e.key)) {
++          setTyped((t) => t + e.key)
++          return
++        }
++        if (e.key === 'Enter' && typed.length > 0) {
++          const m = interpretInUnit(typed, unit)
++          if (m !== null && m > 0 && hover) {
++            const d = sub(hover.point, draftStart.point)
++            const len = Math.hypot(d.x, d.y)
++            const u = len > 1e-9 ? { x: d.x / len, y: d.y / len } : { x: 1, y: 0 }
++            const end: Snap = { point: { x: draftStart.point.x + u.x * m, y: draftStart.point.y + u.y * m }, kind: 'free', axis: hover.axis }
++            commitLine(end)
++          }
++          return
++        }
++      }
++      if (e.key.toLowerCase() === 'f') fit()
++      if (e.key.toLowerCase() === 'g') setShowGrid((g) => !g)
++      if (e.key === ' ') setTool('select')
++    }
++    window.addEventListener('keydown', onKey)
++    return () => window.removeEventListener('keydown', onKey)
++  })
++
++  // ---------------------------------------------------------------------
++  // constraint chips for the current selection
++  // ---------------------------------------------------------------------
++  type Chip = { he: string; action: SketchAction }
++  const chips: Chip[] = []
++  if (selLines.length === 1 && selPoints.length === 0) {
++    chips.push({ he: 'אופקי', action: { kind: 'addConstraint', c: { kind: 'horizontal', line: selLines[0]! } } })
++    chips.push({ he: 'אנכי', action: { kind: 'addConstraint', c: { kind: 'vertical', line: selLines[0]! } } })
++    chips.push({ he: 'מידת אורך', action: { kind: 'addDimension', dim: { kind: 'length', refs: [selLines[0]!], driving: true } } })
++    chips.push({ he: 'מדידת אורך (ייחוס)', action: { kind: 'addDimension', dim: { kind: 'length', refs: [selLines[0]!], driving: false } } })
++  }
++  if (selLines.length === 2 && selPoints.length === 0) {
++    const [a, b] = selLines as [string, string]
++    chips.push({ he: 'מקביל', action: { kind: 'addConstraint', c: { kind: 'parallel', a, b } } })
++    chips.push({ he: 'ניצב', action: { kind: 'addConstraint', c: { kind: 'perpendicular', a, b } } })
++    chips.push({ he: 'על אותו ציר', action: { kind: 'addConstraint', c: { kind: 'collinear', a, b } } })
++    chips.push({ he: 'אורכים שווים', action: { kind: 'addConstraint', c: { kind: 'equalLength', a, b } } })
++    chips.push({ he: 'מידת זווית', action: { kind: 'addDimension', dim: { kind: 'angle', refs: [a, b], driving: true } } })
++    chips.push({ he: 'מרחק בין קווים', action: { kind: 'addDimension', dim: { kind: 'lineDistance', refs: [a, b], driving: true } } })
++  }
++  if (selLines.length === 4 && selPoints.length === 0) {
++    const [a, b, c, d] = selLines as [string, string, string, string]
++    chips.push({ he: 'זוויות שוות (1-2 = 3-4)', action: { kind: 'addConstraint', c: { kind: 'equalAngle', a, b, c, d } } })
++  }
++  if (selPoints.length === 1 && selLines.length === 0) {
++    const p = pointById(doc, selPoints[0]!)!
++    chips.push({ he: 'קיבוע נקודה', action: { kind: 'addConstraint', c: { kind: 'fixed', p: p.id, x: p.x, y: p.y } } })
++  }
++  if (selPoints.length === 2 && selLines.length === 0) {
++    const [p, q] = selPoints as [string, string]
++    chips.push({ he: 'נקודות מחוברות', action: { kind: 'addConstraint', c: { kind: 'coincident', p, q } } })
++    chips.push({ he: 'מידת מרחק', action: { kind: 'addDimension', dim: { kind: 'pointDistance', refs: [p, q], driving: true } } })
++    chips.push({ he: 'מדידת מרחק (ייחוס)', action: { kind: 'addDimension', dim: { kind: 'pointDistance', refs: [p, q], driving: false } } })
++  }
++  if (selPoints.length === 1 && selLines.length === 1) {
++    const p = selPoints[0]!
++    const line = selLines[0]!
++    chips.push({ he: 'נקודה על קו', action: { kind: 'addConstraint', c: { kind: 'pointOnLine', p, line } } })
++    chips.push({ he: 'נקודת אמצע', action: { kind: 'addConstraint', c: { kind: 'midpoint', p, line } } })
++    chips.push({ he: 'מידת מרחק מקו', action: { kind: 'addDimension', dim: { kind: 'pointLineDistance', refs: [p, line], driving: true } } })
++  }
++  if (selPoints.length === 2 && selLines.length === 1) {
++    const [p, q] = selPoints as [string, string]
++    chips.push({ he: 'סימטריה סביב הקו', action: { kind: 'addConstraint', c: { kind: 'symmetric', p, q, axis: selLines[0]! } } })
++  }
++  if (selPoints.length === 1 && selLines.length === 2) {
++    const [a, b] = selLines as [string, string]
++    chips.push({ he: 'מרכוז בין הקווים', action: { kind: 'addConstraint', c: { kind: 'centered', p: selPoints[0]!, a, b } } })
++  }
++  const applyChip = (chip: Chip) => {
++    const next = sketchReducer(doc, chip.action)
++    if (next === doc) {
++      say('לא ניתן להוסיף את היחס לבחירה הזו')
++      return
++    }
++    dispatch(chip.action)
++    const after = evaluate(next)
++    say(after.solved.ok ? `נוסף: ${chip.he}` : `«${chip.he}» סותר יחס קיים — היחסים הסותרים מודגשים באדום; מחק או ערוך אחד מהם`)
++  }
++
++  // relation starters for the selection
++  type RelStarter = { he: string; flow: PickFlow }
++  const starters: RelStarter[] = []
++  const single = selectedObjects.length === 1 ? selectedObjects[0]! : null
++  if (single) {
++    if (single.kind === 'column') {
++      starters.push({ he: 'על ציר / קו', flow: { relation: 'columnOnAxis', subject: single.id, subjects: [], steps: [{ want: 'lineObject', hint: 'ציר, קו עזר, קיר או קורה' }], collected: [] } })
++      starters.push({ he: 'בפינת קיר', flow: { relation: 'columnAtCorner', subject: single.id, subjects: [], steps: [{ want: 'wall', hint: 'קיר ראשון' }, { want: 'wall', hint: 'קיר שני' }], collected: [] } })
++      starters.push({ he: 'מרחק מקיר', flow: { relation: 'offsetFromWall', subject: single.id, subjects: [], steps: [{ want: 'wall', hint: 'קיר' }], collected: [] } })
++    }
++    if (single.kind === 'beam') {
++      starters.push({ he: 'בין שתי תמיכות', flow: { relation: 'beamBetween', subject: single.id, subjects: [], steps: [{ want: 'support', hint: 'תמיכה ראשונה (עמוד / קיר / קורה)' }, { want: 'support', hint: 'תמיכה שנייה' }], collected: [] } })
++    }
++    if ('line' in single) {
++      starters.push({ he: 'יישור לפי קיר/קורה', flow: { relation: 'alignTo', subject: single.id, subjects: [], steps: [{ want: 'reference', hint: 'קיר או קורה לייחוס' }], collected: [] } })
++      if (single.kind !== 'wall') starters.push({ he: 'מרחק מקיר', flow: { relation: 'offsetFromWall', subject: single.id, subjects: [], steps: [{ want: 'wall', hint: 'קיר' }], collected: [] } })
++    }
++    if (single.kind === 'roofEdge') {
++      starters.push({ he: 'בליטת גג מקיר חוץ', flow: { relation: 'roofOverhang', subject: single.id, subjects: [], steps: [{ want: 'extWall', hint: 'קיר חוץ' }], collected: [] } })
++    }
++  }
++  const selectedColumns = selectedObjects.filter((o) => o.kind === 'column')
++  if (selectedColumns.length >= 1 && selectedColumns.length === selectedObjects.length) {
++    starters.push({ he: `חלוקה (${selectedColumns.length} עמודים) בין שני גבולות`, flow: { relation: 'divide', subject: selectedColumns[0]!.id, subjects: selectedColumns.map((c) => c.id), steps: [{ want: 'point', hint: 'נקודת גבול ראשונה' }, { want: 'point', hint: 'נקודת גבול שנייה' }], collected: [] } })
++  }
++
++  // ---------------------------------------------------------------------
++  // derived UI bits
++  // ---------------------------------------------------------------------
++  const draft: Draft | null = draftStart && hover ? { from: draftStart.point, to: hover.point } : null
++  const preview: PreviewGhost | null = pending
++    ? { positions: new Map(pending.next.points.map((p) => [p.id, { x: p.x, y: p.y }])), affected: new Set(pending.affected) }
++    : null
++  const highlight = useMemo(() => {
++    const s = new Set<string>()
++    if (pick) for (const id of pick.collected) s.add(id)
++    for (const r of dimRefs) s.add(r.id)
++    if (selectedConstraint) {
++      const c = doc.constraints.find((x) => x.id === selectedConstraint)
++      if (c) for (const r of constraintRefs(c)) s.add(r)
++    }
++    return s
++  }, [pick, dimRefs, selectedConstraint, doc.constraints])
++  const conflictNames = [...ev.analysis.conflictObjects].map((id) => objectById(doc, id)?.name ?? id)
++  const conflictLabels = ev.analysis.conflicts.map((cid) => {
++    const c = doc.constraints.find((x) => x.id === cid)
++    if (c) return CONSTRAINT_LABEL_HE[c.kind]
++    const rid = cid.split('~')[0]!
++    const r = doc.relations.find((x) => x.id === rid)
++    return r ? RELATION_LABEL_HE[r.kind] : cid
++  })
++  const cursor = tool === 'pan' ? 'grab' : tool === 'select' ? 'default' : 'crosshair'
++  const hint = pending
++    ? `השינוי «${pending.label}» יזיז גם: ${pending.affected.map((id) => objectById(doc, id)?.name ?? id).join(', ')}`
++    : pick
++      ? `${RELATION_LABEL_HE[pick.relation]}: בחר ${pick.steps[pick.collected.length]?.hint ?? ''}`
++      : message ?? TOOLS.find((t) => t.id === tool)?.hint ?? ''
++
++  const build = () => {
++    if (!derivation.ok) return
++    const withSlope = sketchReducer(sketchReducer(doc, { kind: 'setRoofSlope', slopePct }), { kind: 'setRoofSupports', supports: derivation.supports })
++    dispatch({ kind: 'commitDoc', doc: withSlope })
++    onBuildRoof?.({ doc: withSlope, derivation })
++  }
++
++  const zoomStep = (f: number) => {
++    const { w, h } = sizeRef.current
++    setCamera((c) => zoomAt(c, w, h, { x: w / 2, y: h / 2 }, f))
++  }
++
++  return (
++    <div dir="rtl" className="fixed inset-0 z-50 flex flex-col overflow-hidden bg-bg text-fg" data-testid="parametric-sketcher">
++      {/* top bar */}
++      <header className="flex min-h-[48px] items-center gap-2 border-b border-border bg-surface px-3 py-1">
++        <span className="text-sm font-medium">{title ?? 'שרטוט פרמטרי'}</span>
++        <span aria-hidden className="h-5 w-px bg-border" />
++        <button type="button" className={chipCls} title="בטל (Ctrl+Z)" disabled={hist.past.length === 0} onClick={() => dispatch({ kind: 'undo' })}><Undo2 size={14} /></button>
++        <button type="button" className={chipCls} title="בצע שוב (Ctrl+Y)" disabled={hist.future.length === 0} onClick={() => dispatch({ kind: 'redo' })}><Redo2 size={14} /></button>
++        <span aria-hidden className="h-5 w-px bg-border" />
++        <button type="button" className={chipCls} title="התאם לתצוגה (F)" onClick={fit}><Maximize2 size={14} /></button>
++        <button type="button" className={chipCls} title="הגדל" onClick={() => zoomStep(1.25)}><Plus size={14} /></button>
++        <button type="button" className={chipCls} title="הקטן" onClick={() => zoomStep(1 / 1.25)}><Minus size={14} /></button>
++        <button type="button" className={showGrid ? chipOn : chipCls} title="רשת (G)" onClick={() => setShowGrid((g) => !g)}><Grid2x2 size={14} /></button>
++        <button type="button" className={snapOn ? chipOn : chipCls} title="הצמדה" onClick={() => setSnapOn((s) => !s)}><Crosshair size={14} /></button>
++        <span className="tnum text-xs text-muted">{Math.round(camera.pxPerM)} px/m</span>
++        <span className="flex-1" />
++        <span
++          className={'rounded-md border px-2 py-0.5 text-xs ' + (ev.analysis.conflicts.length > 0 ? 'border-danger bg-danger-soft text-danger' : ev.analysis.dof === 0 ? 'border-brand bg-brand-soft' : 'border-border')}
++          title="מה עדיין חופשי לזוז ומה מוגדר במלואו"
++          data-testid="dof-chip"
++        >
++          {ev.analysis.conflicts.length > 0
++            ? `סתירה: ${ev.analysis.conflicts.length} יחסים`
++            : ev.analysis.dof === 0
++              ? 'מוגדר במלואו'
++              : `דרגות חופש: ${ev.analysis.dof} · נקודות חופשיות: ${ev.analysis.freePoints.size}`}
++        </span>
++        <button type="button" className="min-h-[36px] rounded-md bg-brand px-3 text-xs font-medium text-white hover:bg-brand-dark disabled:opacity-50" disabled={!derivation.ok} onClick={build}>
++          {roofExists ? 'עדכן גג מהשרטוט' : 'צור גג מהשרטוט'}
++        </button>
++        <button type="button" className={chipCls} title="סגור" onClick={onClose}><X size={14} /></button>
++      </header>
++
++      <div className="flex min-h-0 flex-1">
++        {/* tool rail */}
++        <aside className="flex w-[72px] flex-col items-stretch gap-1 overflow-y-auto border-l border-border bg-surface p-1">
++          {TOOLS.map((t) => (
++            <button
++              key={t.id}
++              type="button"
++              aria-pressed={tool === t.id}
++              title={t.hint}
++              onClick={() => {
++                setTool(t.id)
++                cancelAll()
++                say(t.hint)
++              }}
++              className={'flex min-h-[48px] flex-col items-center justify-center gap-0.5 rounded-md border text-[10px] ' + (tool === t.id ? 'border-brand bg-brand text-white' : 'border-transparent text-fg hover:bg-surface-2')}
++            >
++              <t.icon size={16} strokeWidth={1.75} />
++              {t.he}
++            </button>
++          ))}
++          <span className="flex-1" />
++          <button
++            type="button"
++            title="מחק את הבחירה (Delete)"
++            disabled={selection.size === 0 && !selectedConstraint}
++            onClick={() => {
++              if (selectedConstraint) {
++                dispatch({ kind: 'removeConstraint', id: selectedConstraint })
++                setSelectedConstraint(null)
++                return
++              }
++              for (const id of selection) {
++                if (objectById(doc, id)) dispatch({ kind: 'removeObject', id })
++                else if (lineById(doc, id)) dispatch({ kind: 'deleteLines', ids: [id] })
++              }
++              setSelection(new Set())
++            }}
++            className="flex min-h-[48px] flex-col items-center justify-center gap-0.5 rounded-md border border-transparent text-[10px] text-danger hover:bg-danger-soft disabled:opacity-40"
++          >
++            <Trash2 size={16} strokeWidth={1.75} />
++            מחיקה
++          </button>
++        </aside>
++
++        {/* canvas */}
++        <main className="relative min-w-0 flex-1">
++          <SketchCanvas
++            doc={doc}
++            positions={positions}
++            evaluation={ev}
++            selection={selection}
++            highlight={highlight}
++            snap={hover}
++            draft={draft}
++            preview={preview}
++            camera={camera}
++            onCamera={setCamera}
++            showGrid={showGrid}
++            panMode={tool === 'pan'}
++            unit={unit}
++            cursor={cursor}
++            typed={typed}
++            onDown={onDown}
++            onMove={onMove}
++            onUp={onUp}
++            onSize={onSize}
++            onDimensionClick={(id) => {
++              const d = doc.dimensions.find((x) => x.id === id)
++              if (!d) return
++              setTool('select')
++              setSelection(new Set())
++              setSelectedConstraint(d.constraintId ?? null)
++              if (d.driving && d.constraintId) {
++                const cur = measureDimension(doc, d) ?? 0
++                const raw = window.prompt(`ערך חדש (${d.kind === 'angle' ? 'מעלות' : unit})`, d.kind === 'angle' ? cur.toFixed(1) : formatLength(Math.abs(cur), unit))
++                if (raw === null) return
++                const v = d.kind === 'angle' ? parseFloat(raw) : interpretInUnit(raw, unit)
++                if (v === null || !Number.isFinite(v)) return
++                withPreview({ kind: 'setConstraintValue', id: d.constraintId, value: v }, 'מידה', [])
++              }
++            }}
++            onConstraintClick={(id) => {
++              setSelectedConstraint(id)
++              const c = doc.constraints.find((x) => x.id === id)
++              if (c) say(`${CONSTRAINT_LABEL_HE[c.kind]} — Delete מוחק`)
++            }}
++          />
++          {/* hint / message bar */}
++          <div className={'pointer-events-none absolute inset-x-2 bottom-2 flex items-center gap-2 rounded-md border px-3 py-1 text-xs shadow-card ' + (pending ? 'border-brand bg-brand-soft' : 'border-border bg-surface/95')} data-testid="hint-bar">
++            <span className="flex-1 truncate">{hint}</span>
++            {pending && (
++              <span className="pointer-events-auto flex gap-1">
++                <button type="button" className={chipOn} onClick={confirmPending}>אשר</button>
++                <button type="button" className={chipCls} onClick={() => setPending(null)}>בטל</button>
++              </span>
++            )}
++          </div>
++          {ev.analysis.conflicts.length > 0 && !pending && (
++            <div className="absolute inset-x-2 top-2 rounded-md border border-danger bg-danger-soft px-3 py-1.5 text-xs text-danger shadow-card" data-testid="conflict-banner">
++              <b>אילוצים סותרים</b> — הגאומטריה נשארה במצב העקבי האחרון. הסר או ערוך אחד מהיחסים המודגשים: {conflictLabels.join(', ')}
++              {conflictNames.length > 0 && <> · אובייקטים מעורבים: {conflictNames.join(', ')}</>}
++            </div>
++          )}
++        </main>
++
++        {/* properties */}
++        <aside className="flex w-[300px] flex-col gap-2 overflow-y-auto border-r border-border bg-bg p-2">
++          {pick && (
++            <div className={panelCls + ' border-brand'}>
++              <div className="text-xs">{RELATION_LABEL_HE[pick.relation]} · {pick.collected.length}/{pick.steps.length}</div>
++              <div className="text-[11px] text-muted">לחץ על הבד: {pick.steps[pick.collected.length]?.hint}</div>
++              <button type="button" className={chipCls + ' mt-1'} onClick={() => setPick(null)}>בטל</button>
++            </div>
++          )}
++          {selectedObjects.length === 1 && (
++            <ObjectProperties
++              o={selectedObjects[0]!}
++              unit={unit}
++              onPatch={(patch) => withPreview({ kind: 'updateObject', id: selectedObjects[0]!.id, patch }, `עריכת ${selectedObjects[0]!.name}`, [selectedObjects[0]!.id])}
++              onRemove={() => {
++                dispatch({ kind: 'removeObject', id: selectedObjects[0]!.id })
++                setSelection(new Set())
++              }}
++            />
++          )}
++          {selectedObjects.length > 1 && (
++            <div className={panelCls + ' text-xs'}>{selectedObjects.length} אובייקטים נבחרו: {selectedObjects.map((o) => `${OBJECT_LABEL_HE[o.kind]} ${o.name}`).join(', ')}</div>
++          )}
++          {selection.size > 0 && selectedObjects.length === 0 && (
++            <div className={panelCls + ' text-xs'}>
++              {selPoints.length > 0 && <div>נקודות: {selPoints.map((p) => (ev.analysis.freePoints.has(p) ? `${p} (חופשית)` : `${p} (מוגדרת)`)).join(', ')}</div>}
++              {selLines.length > 0 && <div>קווים: {selLines.join(', ')}</div>}
++              {selLines.length === 1 && (
++                <div className="mt-1 flex flex-wrap gap-1">
++                  <span className="text-[11px] text-muted">המר ל:</span>
++                  {([['קיר חוץ', { kind: 'wall', wallType: 'exterior' }], ['קיר פנים', { kind: 'wall', wallType: 'interior' }], ['קורה', { kind: 'beam' }], ['קו עזר', { kind: 'aux', auxType: 'guide' }], ['ציר', { kind: 'aux', auxType: 'axis' }], ['קצה גג', { kind: 'roofEdge', edgeType: 'eave' }]] as [string, ObjectSpec][]).map(([he, as]) => (
++                    <button key={he} type="button" className={chipCls} onClick={() => dispatch({ kind: 'convertLine', line: selLines[0]!, as })}>{he}</button>
++                  ))}
++                </div>
++              )}
++            </div>
++          )}
++          {chips.length > 0 && (
++            <div className={panelCls}>
++              <div className="mb-1 text-xs font-medium">הוסף יחס גאומטרי</div>
++              <div className="flex flex-wrap gap-1">
++                {chips.map((c) => <button key={c.he} type="button" className={chipCls} onClick={() => applyChip(c)}>{c.he}</button>)}
++              </div>
++            </div>
++          )}
++          {starters.length > 0 && (
++            <div className={panelCls}>
++              <div className="mb-1 text-xs font-medium">הוסף יחס מבני</div>
++              <div className="flex flex-wrap gap-1">
++                {starters.map((s) => (
++                  <button key={s.he} type="button" className={chipCls} onClick={() => { setPick(s.flow); setTool('select'); say(s.flow.steps[0]!.hint) }}>{s.he}</button>
++                ))}
++              </div>
++            </div>
++          )}
++          <ConstraintList
++            doc={doc}
++            ev={ev}
++            ids={selection.size > 0 ? constraintsOfSelection : selectedConstraint ? [selectedConstraint] : ev.analysis.conflicts.filter((c) => doc.constraints.some((x) => x.id === c))}
++            unit={unit}
++            selectedId={selectedConstraint}
++            onSelect={setSelectedConstraint}
++            onRemove={(id) => {
++              dispatch({ kind: 'removeConstraint', id })
++              if (selectedConstraint === id) setSelectedConstraint(null)
++            }}
++            onSetValue={(id, v) => withPreview({ kind: 'setConstraintValue', id, value: v }, 'שינוי מידה', [])}
++            onToggleDriving={(d) => dispatch({ kind: 'setDimensionDriving', id: d.id, driving: false })}
++          />
++          <ReferenceDimensionList doc={doc} dims={selection.size > 0 ? refDimsOfSelection : doc.dimensions.filter((d) => !d.driving)} unit={unit} onRemove={(id) => dispatch({ kind: 'removeDimension', id })} onMakeDriving={(d) => dispatch({ kind: 'setDimensionDriving', id: d.id, driving: true })} />
++          <RelationList
++            doc={doc}
++            ev={ev}
++            relations={selection.size > 0 ? relationsOfSelection : doc.relations}
++            unit={unit}
++            onRemove={(id) => dispatch({ kind: 'removeRelation', id })}
++            onPatch={(id, patch) => withPreview({ kind: 'updateRelation', id, patch }, 'שינוי יחס', [])}
++          />
++          <RoofPanel doc={doc} derivation={derivation} slopePct={slopePct} onSlope={setSlopePct} onBuild={build} buildLabel={roofExists ? 'עדכן גג מהשרטוט' : 'צור גג מהשרטוט'} />
++          <LayersPanel doc={doc} onSet={(key, patch) => dispatch({ kind: 'setLayer', key, patch })} />
++          <div className="text-[10px] text-muted">
++            אובייקטים: {doc.objects.length} · יחסים: {doc.constraints.length + doc.relations.length} · מידות: {doc.dimensions.length}
++            {ev.analysis.redundant.length > 0 && <> · יחסים כפולים: {ev.analysis.redundant.length}</>}
++          </div>
++        </aside>
++      </div>
++    </div>
++  )
++}
++
+diff --git a/src/parametric/ui/SketchCanvas.tsx b/src/parametric/ui/SketchCanvas.tsx
+new file mode 100644
+index 0000000..d4085b5
+--- /dev/null
++++ b/src/parametric/ui/SketchCanvas.tsx
+@@ -0,0 +1,605 @@
++// src/parametric/ui/SketchCanvas.tsx
++// The drawing surface of the parametric sketcher (owner brief §5): a fixed,
++// full-size SVG — never a scrolling page. Wheel = zoom about the cursor,
++// middle button (or the hand tool) = pan. Renders geometry, semantic objects,
++// dimensions (driving = boxed, reference = in parentheses), constraint
++// badges, free/defined points, conflicts (red) and the live preview ghost.
++// All logic lives in ParametricSketcher.tsx; this file only draws and
++// forwards pointer events in WORLD coordinates.
++import { useCallback, useEffect, useRef, useState, type PointerEvent as RPointerEvent, type WheelEvent as RWheelEvent } from 'react'
++import type { Constraint, Dimension, Pt, SketchDoc, SketchObject } from '../model'
++import { CONSTRAINT_LABEL_HE, constraintRefs, layerOf, lineById } from '../model'
++import { bodyPolygon, columnPolygon, openingGeometry } from '../objects'
++import { add, leftNormal, mid, scale, sub, unit as unitVec } from '../geom'
++import type { Evaluation } from '../doc'
++import { measureDimension } from '../doc'
++import { formatLength, type LengthUnit } from '../../roofwizard/units'
++import { gridStepM, panBy, toScreen, toWorld, zoomAt, type Camera } from './camera'
++import type { Snap } from './snap'
++import { hitTest, type Hit } from './hit'
++
++export interface Draft {
++  from: Pt
++  to: Pt
++}
++
++export interface PreviewGhost {
++  positions: ReadonlyMap<string, Pt>
++  affected: ReadonlySet<string>
++}
++
++export interface CanvasPointer {
++  world: Pt
++  screen: Pt
++  hit: Hit | null
++  button: number
++  shift: boolean
++}
++
++export interface SketchCanvasProps {
++  doc: SketchDoc
++  positions: ReadonlyMap<string, Pt>
++  evaluation: Evaluation
++  selection: ReadonlySet<string>
++  /** Ids to emphasise during a pick flow (candidates). */
++  highlight: ReadonlySet<string>
++  snap: Snap | null
++  draft: Draft | null
++  preview: PreviewGhost | null
++  camera: Camera
++  onCamera: (c: Camera) => void
++  showGrid: boolean
++  panMode: boolean
++  unit: LengthUnit
++  cursor: string
++  onDown: (p: CanvasPointer, ev: RPointerEvent<SVGSVGElement>) => void
++  onMove: (p: CanvasPointer, ev: RPointerEvent<SVGSVGElement>) => void
++  onUp: (p: CanvasPointer, ev: RPointerEvent<SVGSVGElement>) => void
++  onDimensionClick: (id: string) => void
++  onConstraintClick: (id: string) => void
++  onSize: (w: number, h: number) => void
++  /** Typed-length readout while drawing (owner: numeric entry on the fly). */
++  typed?: string
++}
++
++const HIT_TOL_PX = 9
++
++const C = {
++  grid: '#ececea',
++  gridMajor: '#dcdcd8',
++  axis: '#c9c9c4',
++  line: '#1f1f1f',
++  wallExt: '#c7c7c2',
++  wallInt: '#e4e4e0',
++  wallStroke: '#4a4a46',
++  beam: '#8b6a3e',
++  beamFill: '#e9dcc8',
++  column: '#3f3f3b',
++  opening: '#ffffff',
++  aux: '#7a8aa6',
++  roof: '#3f4a6b',
++  sel: '#2563eb',
++  free: '#2563eb',
++  defined: '#1f1f1f',
++  conflict: '#c0392b',
++  ghost: '#3f4a6b',
++  dimDriving: '#1f1f1f',
++  dimRef: '#6b6b66',
++  snap: '#059669',
++  hl: '#d97706',
++} as const
++
++export function SketchCanvas(props: SketchCanvasProps) {
++  const { doc, positions, evaluation, selection, highlight, snap, draft, preview, camera, onCamera, showGrid, panMode, unit, cursor } = props
++  const svgRef = useRef<SVGSVGElement>(null)
++  const [size, setSize] = useState({ w: 800, h: 600 })
++  const panRef = useRef<{ x: number; y: number; cam: Camera } | null>(null)
++
++  useEffect(() => {
++    const el = svgRef.current
++    if (!el) return
++    const ro = new ResizeObserver((entries) => {
++      const r = entries[0]?.contentRect
++      if (!r) return
++      const w = Math.max(1, Math.round(r.width))
++      const h = Math.max(1, Math.round(r.height))
++      setSize({ w, h })
++      props.onSize(w, h)
++    })
++    ro.observe(el)
++    return () => ro.disconnect()
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [])
++
++  // Non-passive wheel listener: the page must never scroll under the canvas.
++  useEffect(() => {
++    const el = svgRef.current
++    if (!el) return
++    const h = (e: WheelEvent) => e.preventDefault()
++    el.addEventListener('wheel', h, { passive: false })
++    return () => el.removeEventListener('wheel', h)
++  }, [])
++
++  const { w, h } = size
++  const S = useCallback((p: Pt): Pt => toScreen(camera, w, h, p), [camera, w, h])
++  const P = (id: string): Pt | undefined => positions.get(id)
++
++  const screenOf = (ev: RPointerEvent<SVGSVGElement> | RWheelEvent<SVGSVGElement>): Pt => {
++    const r = svgRef.current!.getBoundingClientRect()
++    return { x: ev.clientX - r.left, y: ev.clientY - r.top }
++  }
++  const pointerInfo = (ev: RPointerEvent<SVGSVGElement>): CanvasPointer => {
++    const screen = screenOf(ev)
++    const world = toWorld(camera, w, h, screen)
++    const hit = hitTest(doc, positions, world, HIT_TOL_PX / camera.pxPerM)
++    return { world, screen, hit, button: ev.button, shift: ev.shiftKey }
++  }
++
++  const onWheel = (ev: RWheelEvent<SVGSVGElement>) => {
++    const factor = ev.deltaY < 0 ? 1.15 : 1 / 1.15
++    onCamera(zoomAt(camera, w, h, screenOf(ev), factor))
++  }
++  const onPointerDown = (ev: RPointerEvent<SVGSVGElement>) => {
++    svgRef.current?.setPointerCapture(ev.pointerId)
++    if (ev.button === 1 || (panMode && ev.button === 0)) {
++      panRef.current = { x: ev.clientX, y: ev.clientY, cam: camera }
++      ev.preventDefault()
++      return
++    }
++    props.onDown(pointerInfo(ev), ev)
++  }
++  const onPointerMove = (ev: RPointerEvent<SVGSVGElement>) => {
++    if (panRef.current) {
++      const { x, y, cam } = panRef.current
++      onCamera(panBy(cam, ev.clientX - x, ev.clientY - y))
++      return
++    }
++    props.onMove(pointerInfo(ev), ev)
++  }
++  const onPointerUp = (ev: RPointerEvent<SVGSVGElement>) => {
++    if (panRef.current) {
++      panRef.current = null
++      return
++    }
++    props.onUp(pointerInfo(ev), ev)
++  }
++
++  // ---- derived render data
++  const layerVisible = (o: SketchObject): boolean => !o.hidden && doc.layers[layerOf(o)].visible
++  const ownedLines = new Set<string>()
++  for (const o of doc.objects) {
++    if ('line' in o) ownedLines.add(o.line)
++    if (o.kind === 'roofOutline') for (const l of o.lines) ownedLines.add(l)
++  }
++  const hiddenLines = new Set<string>()
++  for (const o of doc.objects) {
++    if (layerVisible(o)) continue
++    if ('line' in o) hiddenLines.add(o.line)
++    if (o.kind === 'roofOutline') for (const l of o.lines) hiddenLines.add(l)
++  }
++  const conflictPts = new Set<string>()
++  const conflictLines = new Set<string>()
++  for (const c of [...doc.constraints]) {
++    if (evaluation.analysis.status.get(c.id) !== 'conflict') continue
++    for (const r of constraintRefs(c)) {
++      if (lineById(doc, r)) conflictLines.add(r)
++      else conflictPts.add(r)
++    }
++  }
++  const conflictObjects = evaluation.analysis.conflictObjects
++  const isSel = (id: string): boolean => selection.has(id)
++
++  const strokeFor = (id: string, base: string): string =>
++    isSel(id) ? C.sel : highlight.has(id) ? C.hl : conflictLines.has(id) || conflictObjects.has(id) ? C.conflict : base
++
++  // ---- grid
++  const gridEls: React.ReactNode[] = []
++  if (showGrid) {
++    const step = gridStepM(camera.pxPerM)
++    const tl = toWorld(camera, w, h, { x: 0, y: 0 })
++    const br = toWorld(camera, w, h, { x: w, y: h })
++    const x0 = Math.floor(tl.x / step) * step
++    const x1 = Math.ceil(br.x / step) * step
++    const y0 = Math.floor(br.y / step) * step
++    const y1 = Math.ceil(tl.y / step) * step
++    const count = (x1 - x0) / step + (y1 - y0) / step
++    if (count < 600) {
++      for (let x = x0; x <= x1 + 1e-9; x += step) {
++        const major = Math.abs(Math.round(x / step) % 5) === 0
++        const sx = S({ x, y: 0 }).x
++        gridEls.push(<line key={`gx${x.toFixed(4)}`} x1={sx} y1={0} x2={sx} y2={h} stroke={Math.abs(x) < 1e-9 ? C.axis : major ? C.gridMajor : C.grid} strokeWidth={Math.abs(x) < 1e-9 ? 1.5 : 1} />)
++      }
++      for (let y = y0; y <= y1 + 1e-9; y += step) {
++        const major = Math.abs(Math.round(y / step) % 5) === 0
++        const sy = S({ x: 0, y }).y
++        gridEls.push(<line key={`gy${y.toFixed(4)}`} x1={0} y1={sy} x2={w} y2={sy} stroke={Math.abs(y) < 1e-9 ? C.axis : major ? C.gridMajor : C.grid} strokeWidth={Math.abs(y) < 1e-9 ? 1.5 : 1} />)
++      }
++    }
++  }
++
++  // ---- preview ghost
++  const ghostEls: React.ReactNode[] = []
++  if (preview) {
++    for (const l of doc.lines) {
++      const a = preview.positions.get(l.a)
++      const b = preview.positions.get(l.b)
++      if (!a || !b) continue
++      const sa = S(a)
++      const sb = S(b)
++      ghostEls.push(<line key={`g${l.id}`} x1={sa.x} y1={sa.y} x2={sb.x} y2={sb.y} stroke={C.ghost} strokeWidth={1.5} strokeDasharray="6 4" opacity={0.7} />)
++    }
++    for (const o of doc.objects) {
++      if (!preview.affected.has(o.id)) continue
++      const poly = o.kind === 'column' ? columnPolygon(doc, o, preview.positions) : o.kind === 'wall' || o.kind === 'beam' ? bodyPolygon(doc, o, preview.positions) : null
++      if (poly) ghostEls.push(<polygon key={`gp${o.id}`} points={poly.map((p) => `${S(p).x},${S(p).y}`).join(' ')} fill="none" stroke={C.ghost} strokeWidth={1.5} strokeDasharray="6 4" opacity={0.8} />)
++    }
++  }
++
++  // ---- objects
++  const objEls: React.ReactNode[] = []
++  const labelEls: React.ReactNode[] = []
++  const sorted = [...doc.objects].sort((a, b) => drawRank(a) - drawRank(b))
++  for (const o of sorted) {
++    if (!layerVisible(o)) continue
++    const stroke = strokeFor(o.id, C.wallStroke)
++    const sw = isSel(o.id) || highlight.has(o.id) ? 2.5 : 1.25
++    if (o.kind === 'wall' || o.kind === 'beam') {
++      const poly = bodyPolygon(doc, o, positions)
++      if (!poly) continue
++      const pts = poly.map((p) => S(p))
++      const fill = o.kind === 'wall' ? (o.wallType === 'exterior' ? C.wallExt : C.wallInt) : C.beamFill
++      objEls.push(
++        <polygon
++          key={o.id}
++          points={pts.map((p) => `${p.x},${p.y}`).join(' ')}
++          fill={fill}
++          stroke={o.kind === 'beam' ? strokeFor(o.id, C.beam) : stroke}
++          strokeWidth={sw}
++          strokeDasharray={o.role === 'non-bearing' ? '4 3' : undefined}
++          data-object={o.id}
++        />,
++      )
++      const seg = lineById(doc, o.line)
++      const a = seg ? P(seg.a) : undefined
++      const b = seg ? P(seg.b) : undefined
++      if (a && b) {
++        const sa = S(a)
++        const sb = S(b)
++        objEls.push(<line key={`${o.id}-axis`} x1={sa.x} y1={sa.y} x2={sb.x} y2={sb.y} stroke={o.kind === 'beam' ? C.beam : C.wallStroke} strokeWidth={0.75} strokeDasharray={o.kind === 'beam' ? '8 4' : undefined} opacity={0.8} />)
++        const m = S(mid(a, b))
++        labelEls.push(<text key={`${o.id}-n`} x={m.x} y={m.y - 6} fontSize={11} textAnchor="middle" fill={C.line} className="select-none">{o.name}</text>)
++      }
++    } else if (o.kind === 'column') {
++      const poly = columnPolygon(doc, o, positions)
++      if (!poly) continue
++      const pts = poly.map((p) => S(p))
++      objEls.push(
++        <polygon key={o.id} points={pts.map((p) => `${p.x},${p.y}`).join(' ')} fill={o.role === 'bearing' ? C.column : '#9a9a95'} stroke={strokeFor(o.id, C.column)} strokeWidth={sw} data-object={o.id} />,
++      )
++      const c = P(o.point)
++      if (c) {
++        const sc = S(c)
++        labelEls.push(<text key={`${o.id}-n`} x={sc.x + 10} y={sc.y - 8} fontSize={11} fill={C.line} className="select-none">{o.name}</text>)
++      }
++    } else if (o.kind === 'opening') {
++      const g = openingGeometry(doc, o, positions)
++      if (!g) continue
++      const pts = g.polygon.map((p) => S(p))
++      objEls.push(<polygon key={o.id} points={pts.map((p) => `${p.x},${p.y}`).join(' ')} fill={C.opening} stroke={strokeFor(o.id, C.wallStroke)} strokeWidth={sw} data-object={o.id} />)
++      const sa = S(g.seg.a)
++      const sb = S(g.seg.b)
++      objEls.push(<line key={`${o.id}-s`} x1={sa.x} y1={sa.y} x2={sb.x} y2={sb.y} stroke={C.wallStroke} strokeWidth={0.75} />)
++      const m = S(mid(g.seg.a, g.seg.b))
++      labelEls.push(<text key={`${o.id}-n`} x={m.x} y={m.y + 4} fontSize={10} textAnchor="middle" fill={C.line} className="select-none">{o.name}</text>)
++    } else if (o.kind === 'aux' || o.kind === 'roofEdge') {
++      const seg = lineById(doc, o.line)
++      const a = seg ? P(seg.a) : undefined
++      const b = seg ? P(seg.b) : undefined
++      if (!a || !b) continue
++      const sa = S(a)
++      const sb = S(b)
++      const base = o.kind === 'aux' ? C.aux : C.roof
++      objEls.push(
++        <line key={o.id} x1={sa.x} y1={sa.y} x2={sb.x} y2={sb.y} stroke={strokeFor(o.id, base)} strokeWidth={isSel(o.id) ? 2.5 : o.kind === 'roofEdge' ? 2 : 1} strokeDasharray={o.kind === 'aux' ? (o.auxType === 'axis' ? '14 4 2 4' : '5 4') : '10 4 2 4'} data-object={o.id} />,
++      )
++      const m = S(mid(a, b))
++      labelEls.push(<text key={`${o.id}-n`} x={m.x} y={m.y - 5} fontSize={10} textAnchor="middle" fill={base} className="select-none">{o.name}</text>)
++    } else if (o.kind === 'roofOutline') {
++      const pts: Pt[] = []
++      for (const lid of o.lines) {
++        const l = lineById(doc, lid)
++        const a = l ? P(l.a) : undefined
++        const b = l ? P(l.b) : undefined
++        if (a && b) pts.push(a, b)
++      }
++      for (let i = 0; i + 1 < pts.length; i += 2) {
++        const sa = S(pts[i]!)
++        const sb = S(pts[i + 1]!)
++        objEls.push(<line key={`${o.id}-${i}`} x1={sa.x} y1={sa.y} x2={sb.x} y2={sb.y} stroke={strokeFor(o.id, C.roof)} strokeWidth={2.5} strokeDasharray="12 5" />)
++      }
++    }
++  }
++
++  // ---- bare lines (no owner)
++  const lineEls: React.ReactNode[] = []
++  for (const l of doc.lines) {
++    if (ownedLines.has(l.id) || hiddenLines.has(l.id)) continue
++    const a = P(l.a)
++    const b = P(l.b)
++    if (!a || !b) continue
++    const sa = S(a)
++    const sb = S(b)
++    lineEls.push(
++      <line key={l.id} x1={sa.x} y1={sa.y} x2={sb.x} y2={sb.y} stroke={strokeFor(l.id, l.construction ? C.aux : C.line)} strokeWidth={isSel(l.id) ? 2.5 : 1.5} strokeDasharray={l.construction ? '5 4' : undefined} data-line={l.id} />,
++    )
++  }
++
++  // ---- points
++  const pointEls: React.ReactNode[] = []
++  const visiblePoint = (id: string): boolean => {
++    const owners = doc.lines.filter((l) => l.a === id || l.b === id)
++    if (owners.length > 0 && owners.every((l) => hiddenLines.has(l.id))) return false
++    return true
++  }
++  for (const pt of doc.points) {
++    if (!visiblePoint(pt.id)) continue
++    const p = P(pt.id) ?? pt
++    const s = S(p)
++    const free = evaluation.analysis.freePoints.has(pt.id)
++    const conflict = conflictPts.has(pt.id)
++    const sel = isSel(pt.id)
++    pointEls.push(
++      <circle
++        key={pt.id}
++        cx={s.x}
++        cy={s.y}
++        r={sel ? 5 : 3.5}
++        fill={conflict ? C.conflict : free ? '#ffffff' : C.defined}
++        stroke={sel ? C.sel : conflict ? C.conflict : free ? C.free : C.defined}
++        strokeWidth={sel ? 2 : 1.5}
++        data-point={pt.id}
++      />,
++    )
++  }
++
++  // ---- dimensions
++  const dimEls: React.ReactNode[] = []
++  if (doc.layers.dims.visible) {
++    for (const d of doc.dimensions) {
++      const el = renderDimension(doc, positions, d, S, unit, evaluation, isSel(d.id), () => props.onDimensionClick(d.id))
++      if (el) dimEls.push(el)
++    }
++  }
++
++  // ---- constraint badges
++  const badgeEls: React.ReactNode[] = []
++  if (doc.layers.constraints.visible) {
++    const perAnchor = new Map<string, number>()
++    for (const c of doc.constraints) {
++      if (dimensionOf(doc, c.id)) continue // shown as a dimension already
++      const anchor = constraintAnchor(doc, positions, c)
++      if (!anchor) continue
++      const key = `${anchor.x.toFixed(3)},${anchor.y.toFixed(3)}`
++      const k = perAnchor.get(key) ?? 0
++      perAnchor.set(key, k + 1)
++      const s = S(anchor)
++      const st = evaluation.analysis.status.get(c.id)
++      const color = st === 'conflict' ? C.conflict : st === 'redundant' ? C.hl : isSel(c.id) ? C.sel : '#555552'
++      badgeEls.push(
++        <g key={c.id} transform={`translate(${s.x + 8 + k * 18},${s.y + 8})`} onClick={(e) => { e.stopPropagation(); props.onConstraintClick(c.id) }} style={{ cursor: 'pointer' }}>
++          <title>{CONSTRAINT_LABEL_HE[c.kind]}</title>
++          <rect x={0} y={0} width={16} height={14} rx={3} fill="#ffffff" stroke={color} strokeWidth={isSel(c.id) ? 1.75 : 1} />
++          <text x={8} y={10.5} fontSize={9} textAnchor="middle" fill={color} className="select-none">{GLYPH[c.kind]}</text>
++        </g>,
++      )
++    }
++  }
++
++  // ---- draft + snap + typed readout
++  const overlayEls: React.ReactNode[] = []
++  if (draft) {
++    const sa = S(draft.from)
++    const sb = S(draft.to)
++    const d = sub(draft.to, draft.from)
++    const lengthM = Math.hypot(d.x, d.y)
++    const ang = (Math.atan2(d.y, d.x) * 180) / Math.PI
++    overlayEls.push(<line key="draft" x1={sa.x} y1={sa.y} x2={sb.x} y2={sb.y} stroke={C.sel} strokeWidth={1.5} strokeDasharray="4 3" />)
++    const label = props.typed && props.typed.length > 0 ? `${props.typed}▏` : formatLength(lengthM, unit)
++    overlayEls.push(
++      <g key="draft-label" transform={`translate(${sb.x + 12},${sb.y - 12})`}>
++        <rect x={-4} y={-13} width={label.length * 7 + 54} height={18} rx={3} fill="#ffffff" stroke={C.sel} />
++        <text x={0} y={0} fontSize={11} fill={C.line} className="tnum select-none">{`${label} · ${ang.toFixed(1)}°`}</text>
++      </g>,
++    )
++  }
++  if (snap && snap.kind !== 'free') {
++    const s = S(snap.point)
++    overlayEls.push(
++      <g key="snap">
++        {snap.kind === 'point' && <circle cx={s.x} cy={s.y} r={7} fill="none" stroke={C.snap} strokeWidth={2} />}
++        {snap.kind === 'intersection' && <g stroke={C.snap} strokeWidth={2}><line x1={s.x - 6} y1={s.y - 6} x2={s.x + 6} y2={s.y + 6} /><line x1={s.x - 6} y1={s.y + 6} x2={s.x + 6} y2={s.y - 6} /></g>}
++        {snap.kind === 'midpoint' && <polygon points={`${s.x},${s.y - 7} ${s.x - 7},${s.y + 6} ${s.x + 7},${s.y + 6}`} fill="none" stroke={C.snap} strokeWidth={2} />}
++        {(snap.kind === 'on-line' || snap.kind === 'axis') && <rect x={s.x - 5} y={s.y - 5} width={10} height={10} fill="none" stroke={C.snap} strokeWidth={2} transform={`rotate(45 ${s.x} ${s.y})`} />}
++        {snap.kind === 'grid' && <circle cx={s.x} cy={s.y} r={2.5} fill={C.snap} />}
++        {snap.axis && draft && (
++          <line x1={S(draft.from).x} y1={S(draft.from).y} x2={s.x} y2={s.y} stroke={C.snap} strokeWidth={1} strokeDasharray="2 3" />
++        )}
++      </g>,
++    )
++  }
++
++  return (
++    <svg
++      ref={svgRef}
++      className="block h-full w-full touch-none select-none bg-surface"
++      style={{ cursor }}
++      onWheel={onWheel}
++      onPointerDown={onPointerDown}
++      onPointerMove={onPointerMove}
++      onPointerUp={onPointerUp}
++      onPointerCancel={onPointerUp}
++      onContextMenu={(e) => e.preventDefault()}
++      data-testid="parametric-canvas"
++    >
++      <g>{gridEls}</g>
++      <g>{ghostEls}</g>
++      <g>{objEls}</g>
++      <g>{lineEls}</g>
++      <g>{dimEls}</g>
++      <g>{badgeEls}</g>
++      <g>{labelEls}</g>
++      <g>{pointEls}</g>
++      <g>{overlayEls}</g>
++    </svg>
++  )
++}
++
++const GLYPH: Record<Constraint['kind'], string> = {
++  horizontal: '—',
++  vertical: '|',
++  parallel: '∥',
++  perpendicular: '⊥',
++  collinear: '≡',
++  equalLength: '=',
++  equalAngle: '∡',
++  coincident: '•',
++  pointOnLine: '⌖',
++  midpoint: '½',
++  symmetric: '⇔',
++  centered: '⊙',
++  fixed: '⚓',
++  length: 'L',
++  pointDistance: 'd',
++  pointLineDistance: 'd',
++  lineDistance: 'd',
++  angle: '∠',
++  equalDistance: '≍',
++}
++
++function drawRank(o: SketchObject): number {
++  switch (o.kind) {
++    case 'roofOutline': return 0
++    case 'roofEdge': return 1
++    case 'aux': return 2
++    case 'wall': return 3
++    case 'beam': return 4
++    case 'opening': return 5
++    case 'column': return 6
++  }
++}
++
++function dimensionOf(doc: SketchDoc, constraintId: string): Dimension | undefined {
++  return doc.dimensions.find((d) => d.constraintId === constraintId)
++}
++
++/** Where to draw a constraint's badge: a line's midpoint or the point itself. */
++function constraintAnchor(doc: SketchDoc, positions: ReadonlyMap<string, Pt>, c: Constraint): Pt | null {
++  const refs = constraintRefs(c)
++  const first = refs[0]
++  if (!first) return null
++  const l = lineById(doc, first)
++  if (l) {
++    const a = positions.get(l.a)
++    const b = positions.get(l.b)
++    return a && b ? mid(a, b) : null
++  }
++  return positions.get(first) ?? null
++}
++
++function renderDimension(
++  doc: SketchDoc,
++  positions: ReadonlyMap<string, Pt>,
++  d: Dimension,
++  S: (p: Pt) => Pt,
++  unit: LengthUnit,
++  ev: Evaluation,
++  selected: boolean,
++  onClick: () => void,
++): React.ReactNode {
++  const value = measureDimension(doc, d, positions)
++  if (value === null) return null
++  const seg = (id: string): { a: Pt; b: Pt } | null => {
++    const l = lineById(doc, id)
++    const a = l ? positions.get(l.a) : undefined
++    const b = l ? positions.get(l.b) : undefined
++    return a && b ? { a, b } : null
++  }
++  let anchor: Pt | null = null
++  let dir: Pt = { x: 1, y: 0 }
++  let extA: Pt | null = null
++  let extB: Pt | null = null
++  switch (d.kind) {
++    case 'length': {
++      const s = seg(d.refs[0]!)
++      if (!s) return null
++      anchor = mid(s.a, s.b)
++      dir = unitVec(sub(s.b, s.a))
++      extA = s.a
++      extB = s.b
++      break
++    }
++    case 'pointDistance': {
++      const a = positions.get(d.refs[0]!)
++      const b = positions.get(d.refs[1]!)
++      if (!a || !b) return null
++      anchor = mid(a, b)
++      dir = unitVec(sub(b, a))
++      extA = a
++      extB = b
++      break
++    }
++    case 'pointLineDistance': {
++      const p = positions.get(d.refs[0]!)
++      const s = seg(d.refs[1]!)
++      if (!p || !s) return null
++      const n = leftNormal(s.a, s.b)
++      const foot = add(p, scale(n, -value))
++      anchor = mid(p, foot)
++      dir = n
++      extA = p
++      extB = foot
++      break
++    }
++    case 'lineDistance': {
++      const a = seg(d.refs[0]!)
++      const b = seg(d.refs[1]!)
++      if (!a || !b) return null
++      const n = leftNormal(a.a, a.b)
++      const m = mid(b.a, b.b)
++      const foot = add(m, scale(n, -value))
++      anchor = mid(m, foot)
++      dir = n
++      extA = m
++      extB = foot
++      break
++    }
++    case 'angle': {
++      const a = seg(d.refs[0]!)
++      const b = seg(d.refs[1]!)
++      if (!a || !b) return null
++      anchor = mid(mid(a.a, a.b), mid(b.a, b.b))
++      break
++    }
++  }
++  if (!anchor) return null
++  const off = d.labelOffsetM ?? { x: -dir.y * 0.35, y: dir.x * 0.35 }
++  const at = S(add(anchor, off))
++  const text = d.kind === 'angle' ? `${value.toFixed(1)}°` : formatLength(Math.abs(value), unit)
++  const label = d.driving ? text : `(${text})`
++  const st = d.constraintId ? ev.analysis.status.get(d.constraintId) : undefined
++  const color = st === 'conflict' ? C.conflict : selected ? C.sel : d.driving ? C.dimDriving : C.dimRef
++  const wpx = Math.max(28, label.length * 7 + 10)
++  return (
++    <g key={d.id} onClick={(e) => { e.stopPropagation(); onClick() }} style={{ cursor: 'pointer' }} data-dimension={d.id}>
++      {extA && extB && (
++        <g stroke={color} strokeWidth={0.75} opacity={0.6}>
++          <line x1={S(add(extA, off)).x} y1={S(add(extA, off)).y} x2={S(add(extB, off)).x} y2={S(add(extB, off)).y} />
++          <line x1={S(extA).x} y1={S(extA).y} x2={S(add(extA, off)).x} y2={S(add(extA, off)).y} />
++          <line x1={S(extB).x} y1={S(extB).y} x2={S(add(extB, off)).x} y2={S(add(extB, off)).y} />
++        </g>
++      )}
++      <rect x={at.x - wpx / 2} y={at.y - 9} width={wpx} height={18} rx={3} fill="#ffffff" stroke={d.driving ? color : 'none'} strokeWidth={selected ? 2 : 1} />
++      <text x={at.x} y={at.y + 4} fontSize={11} textAnchor="middle" fill={color} className="tnum select-none">{label}</text>
++    </g>
++  )
++}
+diff --git a/src/parametric/ui/camera.ts b/src/parametric/ui/camera.ts
+new file mode 100644
+index 0000000..e591a46
+--- /dev/null
++++ b/src/parametric/ui/camera.ts
+@@ -0,0 +1,51 @@
++// src/parametric/ui/camera.ts
++// Canvas camera (owner brief §5): world meters ↔ screen pixels, with y UP in
++// world space (so a CCW angle reads CCW on screen). Zoom keeps the world
++// point under the cursor fixed; fit frames a bounding box with padding.
++import type { Pt } from '../model'
++
++export interface Camera {
++  /** World point at the canvas center. */
++  cx: number
++  cy: number
++  pxPerM: number
++}
++
++export const ZOOM_MIN = 4
++export const ZOOM_MAX = 2000
++
++export function toScreen(cam: Camera, w: number, h: number, p: Pt): Pt {
++  return { x: (p.x - cam.cx) * cam.pxPerM + w / 2, y: (cam.cy - p.y) * cam.pxPerM + h / 2 }
++}
++
++export function toWorld(cam: Camera, w: number, h: number, s: Pt): Pt {
++  return { x: (s.x - w / 2) / cam.pxPerM + cam.cx, y: cam.cy - (s.y - h / 2) / cam.pxPerM }
++}
++
++/** Zoom by `factor` about a SCREEN point. */
++export function zoomAt(cam: Camera, w: number, h: number, screen: Pt, factor: number): Camera {
++  const before = toWorld(cam, w, h, screen)
++  const pxPerM = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, cam.pxPerM * factor))
++  const next = { ...cam, pxPerM }
++  const after = toWorld(next, w, h, screen)
++  return { cx: cam.cx + (before.x - after.x), cy: cam.cy + (before.y - after.y), pxPerM }
++}
++
++export function panBy(cam: Camera, dxPx: number, dyPx: number): Camera {
++  return { ...cam, cx: cam.cx - dxPx / cam.pxPerM, cy: cam.cy + dyPx / cam.pxPerM }
++}
++
++export function fitTo(b: { minX: number; minY: number; maxX: number; maxY: number } | null, w: number, h: number, padPx = 60): Camera {
++  if (!b || w <= 0 || h <= 0) return { cx: 5, cy: 3, pxPerM: 60 }
++  const bw = Math.max(b.maxX - b.minX, 0.5)
++  const bh = Math.max(b.maxY - b.minY, 0.5)
++  const pxPerM = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.min((w - 2 * padPx) / bw, (h - 2 * padPx) / bh)))
++  return { cx: (b.minX + b.maxX) / 2, cy: (b.minY + b.maxY) / 2, pxPerM }
++}
++
++/** A "nice" grid step (meters) for the current zoom: ≥ 24 px apart. */
++export function gridStepM(pxPerM: number): number {
++  const steps = [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 50]
++  for (const s of steps) if (s * pxPerM >= 24) return s
++  return 100
++}
+diff --git a/src/parametric/ui/hit.ts b/src/parametric/ui/hit.ts
+new file mode 100644
+index 0000000..56497e8
+--- /dev/null
++++ b/src/parametric/ui/hit.ts
+@@ -0,0 +1,82 @@
++// src/parametric/ui/hit.ts
++// Hit testing for selection on the parametric canvas. Pure. Returns the
++// topmost thing under a world point: a point first, then an object body
++// (wall/column/beam/opening), then a bare line. Tolerances are meters.
++import type { Pt, SketchDoc, SketchObject } from '../model'
++import { layerOf } from '../model'
++import { bodyPolygon, columnPolygon, openingGeometry } from '../objects'
++import { closestOnSegment, dist } from '../geom'
++
++export type Hit =
++  | { type: 'point'; id: string }
++  | { type: 'object'; id: string; object: SketchObject }
++  | { type: 'line'; id: string }
++
++export function pointInPolygon(p: Pt, poly: readonly Pt[]): boolean {
++  let inside = false
++  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
++    const a = poly[i]!
++    const b = poly[j]!
++    if (a.y > p.y !== b.y > p.y && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) inside = !inside
++  }
++  return inside
++}
++
++export function hitTest(doc: SketchDoc, positions: ReadonlyMap<string, Pt>, p: Pt, tolM: number): Hit | null {
++  const visibleLayer = (o: SketchObject): boolean => !o.hidden && doc.layers[layerOf(o)].visible
++  const hiddenLines = new Set<string>()
++  for (const o of doc.objects) {
++    if (visibleLayer(o)) continue
++    if ('line' in o) hiddenLines.add(o.line)
++    if (o.kind === 'roofOutline') for (const l of o.lines) hiddenLines.add(l)
++  }
++  // Points
++  let best: { d: number; hit: Hit } | null = null
++  for (const pt of doc.points) {
++    const q = positions.get(pt.id) ?? pt
++    const d = dist(q, p)
++    if (d <= tolM && (!best || d < best.d)) best = { d, hit: { type: 'point', id: pt.id } }
++  }
++  if (best) return best.hit
++  // Object bodies (openings before walls: they sit on top).
++  const ordered = [...doc.objects].sort((a, b) => rank(a) - rank(b))
++  for (const o of ordered) {
++    if (!visibleLayer(o)) continue
++    if (o.kind === 'column') {
++      const poly = columnPolygon(doc, o, positions)
++      if (poly && pointInPolygon(p, poly)) return { type: 'object', id: o.id, object: o }
++    } else if (o.kind === 'opening') {
++      const g = openingGeometry(doc, o, positions)
++      if (g && pointInPolygon(p, g.polygon)) return { type: 'object', id: o.id, object: o }
++    } else if (o.kind === 'wall' || o.kind === 'beam') {
++      const poly = bodyPolygon(doc, o, positions)
++      if (poly && pointInPolygon(p, poly)) return { type: 'object', id: o.id, object: o }
++    }
++  }
++  // Lines (incl. aux / roof edge / wall lines by distance)
++  let bestLine: { d: number; id: string } | null = null
++  for (const l of doc.lines) {
++    if (hiddenLines.has(l.id)) continue
++    const a = positions.get(l.a)
++    const b = positions.get(l.b)
++    if (!a || !b) continue
++    const d = dist(closestOnSegment(p, a, b), p)
++    if (d <= tolM && (!bestLine || d < bestLine.d)) bestLine = { d, id: l.id }
++  }
++  if (bestLine) {
++    const owner = doc.objects.find((o) => 'line' in o && o.line === bestLine!.id && visibleLayer(o))
++    if (owner) return { type: 'object', id: owner.id, object: owner }
++    return { type: 'line', id: bestLine.id }
++  }
++  return null
++}
++
++function rank(o: SketchObject): number {
++  switch (o.kind) {
++    case 'opening': return 0
++    case 'column': return 1
++    case 'beam': return 2
++    case 'wall': return 3
++    default: return 4
++  }
++}
+diff --git a/src/parametric/ui/panels.tsx b/src/parametric/ui/panels.tsx
+new file mode 100644
+index 0000000..b246a7f
+--- /dev/null
++++ b/src/parametric/ui/panels.tsx
+@@ -0,0 +1,386 @@
++// src/parametric/ui/panels.tsx
++// Compact side panels of the parametric sketcher (owner brief §5 "פאנל
++// מאפיינים קומפקטי", §4 "לאפשר בחירה, עריכה ומחיקה של כל יחס", §2 object
++// properties, §6 roof supports). Presentational: every edit goes back to
++// ParametricSketcher.tsx through callbacks; nothing here touches the doc.
++import { useEffect, useState } from 'react'
++import { Eye, EyeOff, Lock, LockOpen, Trash2 } from 'lucide-react'
++import type { Constraint, Dimension, LayerKey, SketchDoc, SketchObject, StructuralRelation, StructuralRole, WallFaceRef } from '../model'
++import { CONSTRAINT_LABEL_HE, LAYER_KEYS, OBJECT_LABEL_HE, RELATION_LABEL_HE, ROLE_LABEL_HE, constraintRefs, objectById, relationRefs } from '../model'
++import type { Evaluation } from '../doc'
++import { measureDimension } from '../doc'
++import type { RoofDerivationResult } from '../roofBridge'
++import { supportNames } from '../roofBridge'
++import { formatLength, interpretInUnit, UNIT_HE, type LengthUnit } from '../../roofwizard/units'
++
++export const panelCls = 'rounded-lg border border-border bg-surface p-2 shadow-card'
++export const chipCls = 'min-h-[32px] rounded-md border border-border bg-surface px-2 text-xs text-fg hover:bg-surface-2'
++export const chipOn = 'min-h-[32px] rounded-md border border-brand bg-brand px-2 text-xs text-white'
++const fieldCls = 'tnum min-h-[32px] w-full rounded-md border border-border-strong bg-surface px-2 text-right text-xs focus:border-brand'
++const smallLabel = 'block text-[11px] text-muted'
++
++/** A length field in the active unit (stores meters); commits on blur/Enter. */
++export function LengthField({ label, valueM, unit, onCommit, min }: { label: string; valueM: number; unit: LengthUnit; onCommit: (m: number) => void; min?: number }) {
++  const [text, setText] = useState(formatLength(valueM, unit))
++  useEffect(() => setText(formatLength(valueM, unit)), [valueM, unit])
++  const commit = () => {
++    const m = interpretInUnit(text, unit)
++    if (m === null || (min !== undefined && m < min)) {
++      setText(formatLength(valueM, unit))
++      return
++    }
++    if (Math.abs(m - valueM) > 1e-9) onCommit(m)
++  }
++  return (
++    <label className="block">
++      <span className={smallLabel}>{label} ({UNIT_HE[unit]})</span>
++      <input className={fieldCls} value={text} onChange={(e) => setText(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }} inputMode="decimal" />
++    </label>
++  )
++}
++
++export function NumberField({ label, value, onCommit, step, suffix }: { label: string; value: number; onCommit: (v: number) => void; step?: number; suffix?: string }) {
++  const [text, setText] = useState(String(value))
++  useEffect(() => setText(String(value)), [value])
++  const commit = () => {
++    const v = parseFloat(text)
++    if (!Number.isFinite(v)) {
++      setText(String(value))
++      return
++    }
++    if (v !== value) onCommit(v)
++  }
++  return (
++    <label className="block">
++      <span className={smallLabel}>{label}{suffix ? ` (${suffix})` : ''}</span>
++      <input className={fieldCls} value={text} step={step} onChange={(e) => setText(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }} inputMode="decimal" />
++    </label>
++  )
++}
++
++export function TextField({ label, value, onCommit }: { label: string; value: string; onCommit: (v: string) => void }) {
++  const [text, setText] = useState(value)
++  useEffect(() => setText(value), [value])
++  return (
++    <label className="block">
++      <span className={smallLabel}>{label}</span>
++      <input className={fieldCls + ' text-right'} value={text} onChange={(e) => setText(e.target.value)} onBlur={() => { if (text.trim() && text !== value) onCommit(text.trim()) }} onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }} />
++    </label>
++  )
++}
++
++function Select<T extends string>({ label, value, options, onChange }: { label: string; value: T; options: { v: T; he: string }[]; onChange: (v: T) => void }) {
++  return (
++    <label className="block">
++      <span className={smallLabel}>{label}</span>
++      <select className={fieldCls} value={value} onChange={(e) => onChange(e.target.value as T)}>
++        {options.map((o) => <option key={o.v} value={o.v}>{o.he}</option>)}
++      </select>
++    </label>
++  )
++}
++
++const ROLE_OPTIONS: { v: StructuralRole; he: string }[] = (['bearing', 'non-bearing', 'none'] as StructuralRole[]).map((v) => ({ v, he: ROLE_LABEL_HE[v] }))
++const FACE_OPTIONS: { v: WallFaceRef; he: string }[] = [
++  { v: 'center', he: 'מרכז' },
++  { v: 'faceA', he: 'פן A (שמאל)' },
++  { v: 'faceB', he: 'פן B (ימין)' },
++]
++
++// ---------------------------------------------------------------------------
++// OBJECT PROPERTIES
++// ---------------------------------------------------------------------------
++
++export function ObjectProperties({ o, unit, onPatch, onRemove }: { o: SketchObject; unit: LengthUnit; onPatch: (patch: Partial<SketchObject>) => void; onRemove: () => void }) {
++  return (
++    <div className={panelCls + ' space-y-2'}>
++      <div className="flex items-center justify-between">
++        <span className="text-xs font-medium">{OBJECT_LABEL_HE[o.kind]} · {o.name}</span>
++        <div className="flex items-center gap-1">
++          <button type="button" title={o.locked ? 'שחרר קיבוע' : 'קבע (לא יזוז)'} className="rounded p-1 hover:bg-surface-2" onClick={() => onPatch({ locked: !o.locked })}>
++            {o.locked ? <Lock size={14} /> : <LockOpen size={14} />}
++          </button>
++          <button type="button" title={o.hidden ? 'הצג' : 'הסתר'} className="rounded p-1 hover:bg-surface-2" onClick={() => onPatch({ hidden: !o.hidden })}>
++            {o.hidden ? <EyeOff size={14} /> : <Eye size={14} />}
++          </button>
++          <button type="button" title="מחק אובייקט" className="rounded p-1 text-danger hover:bg-danger-soft" onClick={onRemove}><Trash2 size={14} /></button>
++        </div>
++      </div>
++      <TextField label="שם / קוד" value={o.name} onCommit={(name) => onPatch({ name })} />
++      {o.kind !== 'aux' && o.kind !== 'roofEdge' && o.kind !== 'roofOutline' && o.kind !== 'opening' && (
++        <Select label="תפקיד מבני (כוונת המשתמש — לא אישור הנדסי)" value={o.role} options={ROLE_OPTIONS} onChange={(role) => onPatch({ role })} />
++      )}
++      {o.kind === 'wall' && (
++        <div className="grid grid-cols-2 gap-2">
++          <Select label="סוג" value={o.wallType} options={[{ v: 'exterior', he: 'קיר חוץ' }, { v: 'interior', he: 'קיר פנים' }]} onChange={(wallType) => onPatch({ wallType })} />
++          <Select label="הקו המשורטט הוא" value={o.lineIs} options={FACE_OPTIONS} onChange={(lineIs) => onPatch({ lineIs })} />
++          <LengthField label="עובי" valueM={o.thicknessM} unit={unit} min={0.01} onCommit={(thicknessM) => onPatch({ thicknessM })} />
++          <LengthField label="גובה" valueM={o.heightM} unit={unit} min={0} onCommit={(heightM) => onPatch({ heightM })} />
++        </div>
++      )}
++      {o.kind === 'column' && (
++        <div className="grid grid-cols-2 gap-2">
++          <NumberField label="חתך רוחב" value={o.sectionWmm} suffix="מ״מ" onCommit={(sectionWmm) => onPatch({ sectionWmm })} />
++          <NumberField label="חתך עומק" value={o.sectionHmm} suffix="מ״מ" onCommit={(sectionHmm) => onPatch({ sectionHmm })} />
++          <NumberField label="כיוון" value={o.rotationDeg} suffix="°" onCommit={(rotationDeg) => onPatch({ rotationDeg })} />
++          <LengthField label="גובה" valueM={o.heightM} unit={unit} min={0} onCommit={(heightM) => onPatch({ heightM })} />
++        </div>
++      )}
++      {o.kind === 'beam' && (
++        <div className="grid grid-cols-2 gap-2">
++          <NumberField label="חתך רוחב" value={o.sectionWmm} suffix="מ״מ" onCommit={(sectionWmm) => onPatch({ sectionWmm })} />
++          <NumberField label="חתך גובה" value={o.sectionHmm} suffix="מ״מ" onCommit={(sectionHmm) => onPatch({ sectionHmm })} />
++          <TextField label="חומר" value={o.material} onCommit={(material) => onPatch({ material })} />
++          <LengthField label="מפלס תחתית" valueM={o.levelM} unit={unit} onCommit={(levelM) => onPatch({ levelM })} />
++          <div className="col-span-2 text-[11px] text-muted">נקודות תמיכה: {o.supports.length === 0 ? 'טרם הוגדרו (יחס «קורה בין תמיכות»)' : o.supports.join(', ')}</div>
++        </div>
++      )}
++      {o.kind === 'opening' && (
++        <div className="grid grid-cols-2 gap-2">
++          <LengthField label="מיקום (מתחילת הקיר)" valueM={o.offsetM} unit={unit} min={0} onCommit={(offsetM) => onPatch({ offsetM })} />
++          <LengthField label="רוחב" valueM={o.widthM} unit={unit} min={0.05} onCommit={(widthM) => onPatch({ widthM })} />
++          <LengthField label="גובה" valueM={o.heightM} unit={unit} min={0.05} onCommit={(heightM) => onPatch({ heightM })} />
++          <LengthField label="סף" valueM={o.sillM} unit={unit} min={0} onCommit={(sillM) => onPatch({ sillM })} />
++        </div>
++      )}
++      {o.kind === 'aux' && (
++        <Select label="סוג קו עזר" value={o.auxType} options={[{ v: 'guide', he: 'קו עזר' }, { v: 'axis', he: 'ציר' }, { v: 'grid', he: 'רשת צירים' }]} onChange={(auxType) => onPatch({ auxType })} />
++      )}
++      {o.kind === 'roofEdge' && (
++        <Select label="סוג קצה" value={o.edgeType} options={[{ v: 'eave', he: 'מרזב (eave)' }, { v: 'gable', he: 'גמלון' }, { v: 'spanBoundary', he: 'גבול מפתח' }]} onChange={(edgeType) => onPatch({ edgeType })} />
++      )}
++    </div>
++  )
++}
++
++// ---------------------------------------------------------------------------
++// CONSTRAINTS / DIMENSIONS / RELATIONS OF THE SELECTION
++// ---------------------------------------------------------------------------
++
++function describeRefs(doc: SketchDoc, refs: readonly string[]): string {
++  return refs
++    .map((r) => {
++      const owner = doc.objects.find((o) => ('line' in o && o.line === r) || (o.kind === 'column' && o.point === r))
++      return owner ? owner.name : r
++    })
++    .join(' · ')
++}
++
++export function ConstraintList({ doc, ev, ids, unit, selectedId, onSelect, onRemove, onSetValue, onToggleDriving }: {
++  doc: SketchDoc
++  ev: Evaluation
++  /** Constraint ids to list. */
++  ids: readonly string[]
++  unit: LengthUnit
++  selectedId: string | null
++  onSelect: (id: string) => void
++  onRemove: (id: string) => void
++  onSetValue: (id: string, v: number) => void
++  onToggleDriving: (dim: Dimension) => void
++}) {
++  if (ids.length === 0) return null
++  return (
++    <div className={panelCls + ' space-y-1'}>
++      <div className="text-xs font-medium">יחסים ומידות</div>
++      {ids.map((id) => {
++        const c = doc.constraints.find((x) => x.id === id)
++        if (!c) return null
++        const dim = doc.dimensions.find((d) => d.constraintId === id)
++        const st = ev.analysis.status.get(id) ?? 'ok'
++        return <ConstraintRow key={id} doc={doc} c={c} dim={dim} status={st} unit={unit} selected={selectedId === id} onSelect={() => onSelect(id)} onRemove={() => onRemove(id)} onSetValue={(v) => onSetValue(id, v)} onToggleDriving={dim ? () => onToggleDriving(dim) : undefined} />
++      })}
++    </div>
++  )
++}
++
++function ConstraintRow({ doc, c, dim, status, unit, selected, onSelect, onRemove, onSetValue, onToggleDriving }: {
++  doc: SketchDoc
++  c: Constraint
++  dim?: Dimension
++  status: 'ok' | 'redundant' | 'conflict'
++  unit: LengthUnit
++  selected: boolean
++  onSelect: () => void
++  onRemove: () => void
++  onSetValue: (v: number) => void
++  onToggleDriving?: () => void
++}) {
++  const hasValue = 'valueM' in c || 'valueDeg' in c
++  const value = 'valueDeg' in c ? c.valueDeg : 'valueM' in c ? c.valueM : null
++  const [text, setText] = useState('')
++  useEffect(() => {
++    if (value === null) return
++    setText('valueDeg' in c ? String(value) : formatLength(value, unit))
++  }, [value, unit, c])
++  const commit = () => {
++    if (value === null) return
++    const v = 'valueDeg' in c ? parseFloat(text) : interpretInUnit(text, unit)
++    if (v === null || !Number.isFinite(v)) return
++    if (Math.abs(v - value) > 1e-9) onSetValue(v)
++  }
++  const tone = status === 'conflict' ? 'border-danger bg-danger-soft' : status === 'redundant' ? 'border-[#d97706]' : selected ? 'border-brand' : 'border-border'
++  return (
++    <div className={`flex items-center gap-1 rounded-md border px-1.5 py-1 text-xs ${tone}`} onClick={onSelect} role="button" tabIndex={0}>
++      <span className="flex-1 truncate" title={describeRefs(doc, constraintRefs(c))}>
++        {CONSTRAINT_LABEL_HE[c.kind]}
++        <span className="text-muted"> · {describeRefs(doc, constraintRefs(c))}</span>
++        {status === 'conflict' && <span className="text-danger"> · סתירה</span>}
++        {status === 'redundant' && <span className="text-[#b45309]"> · כפול</span>}
++      </span>
++      {hasValue && (
++        <input className="tnum w-16 rounded border border-border-strong px-1 text-right text-xs" value={text} onChange={(e) => setText(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }} onClick={(e) => e.stopPropagation()} />
++      )}
++      {onToggleDriving && dim && (
++        <button type="button" className="rounded border border-border px-1 text-[10px]" title="הפוך למידת ייחוס (מדידה בלבד)" onClick={(e) => { e.stopPropagation(); onToggleDriving() }}>מניעה</button>
++      )}
++      <button type="button" className="rounded p-0.5 text-danger hover:bg-danger-soft" title="מחק יחס" onClick={(e) => { e.stopPropagation(); onRemove() }}><Trash2 size={13} /></button>
++    </div>
++  )
++}
++
++export function ReferenceDimensionList({ doc, dims, unit, onRemove, onMakeDriving }: { doc: SketchDoc; dims: readonly Dimension[]; unit: LengthUnit; onRemove: (id: string) => void; onMakeDriving: (d: Dimension) => void }) {
++  if (dims.length === 0) return null
++  return (
++    <div className={panelCls + ' space-y-1'}>
++      <div className="text-xs font-medium">מידות ייחוס (מדידה בלבד)</div>
++      {dims.map((d) => {
++        const v = measureDimension(doc, d)
++        return (
++          <div key={d.id} className="flex items-center gap-1 rounded-md border border-border px-1.5 py-1 text-xs">
++            <span className="flex-1">{CONSTRAINT_LABEL_HE[d.kind]} · {describeRefs(doc, d.refs)} = <span className="tnum">{v === null ? '—' : d.kind === 'angle' ? `${v.toFixed(1)}°` : formatLength(Math.abs(v), unit)}</span></span>
++            <button type="button" className="rounded border border-border px-1 text-[10px]" title="הפוך למידה מניעה" onClick={() => onMakeDriving(d)}>ייחוס</button>
++            <button type="button" className="rounded p-0.5 text-danger hover:bg-danger-soft" onClick={() => onRemove(d.id)}><Trash2 size={13} /></button>
++          </div>
++        )
++      })}
++    </div>
++  )
++}
++
++export function RelationList({ doc, ev, relations, unit, onRemove, onPatch }: {
++  doc: SketchDoc
++  ev: Evaluation
++  relations: readonly StructuralRelation[]
++  unit: LengthUnit
++  onRemove: (id: string) => void
++  onPatch: (id: string, patch: Partial<StructuralRelation>) => void
++}) {
++  if (relations.length === 0) return null
++  return (
++    <div className={panelCls + ' space-y-1'}>
++      <div className="text-xs font-medium">יחסים מבניים</div>
++      {relations.map((r) => {
++        const conflict = ev.analysis.conflictRelations.has(r.id)
++        const issue = ev.issues.find((i) => i.relationId === r.id)
++        const names = relationRefs(r).map((id) => objectById(doc, id)?.name ?? id).join(' · ')
++        return (
++          <div key={r.id} className={`space-y-1 rounded-md border px-1.5 py-1 text-xs ${conflict ? 'border-danger bg-danger-soft' : 'border-border'}`}>
++            <div className="flex items-center gap-1">
++              <span className="flex-1 truncate">{RELATION_LABEL_HE[r.kind]} <span className="text-muted">· {names}</span>{conflict && <span className="text-danger"> · סתירה</span>}</span>
++              <button type="button" className="rounded p-0.5 text-danger hover:bg-danger-soft" title="מחק יחס" onClick={() => onRemove(r.id)}><Trash2 size={13} /></button>
++            </div>
++            {issue && <div className="text-danger">{issue.message}</div>}
++            {r.kind === 'offsetFromWall' && (
++              <div className="grid grid-cols-2 gap-1">
++                <Select label="מפני" value={r.ref} options={FACE_OPTIONS} onChange={(ref) => onPatch(r.id, { ref })} />
++                <LengthField label="מרחק" valueM={r.distM} unit={unit} onCommit={(distM) => onPatch(r.id, { distM })} />
++              </div>
++            )}
++            {r.kind === 'columnAtCorner' && (
++              <div className="grid grid-cols-2 gap-1">
++                <Select label={`מפני ${objectById(doc, r.wallA)?.name ?? ''}`} value={r.refA} options={FACE_OPTIONS} onChange={(refA) => onPatch(r.id, { refA })} />
++                <LengthField label="מרחק" valueM={r.distA} unit={unit} onCommit={(distA) => onPatch(r.id, { distA })} />
++                <Select label={`מפני ${objectById(doc, r.wallB)?.name ?? ''}`} value={r.refB} options={FACE_OPTIONS} onChange={(refB) => onPatch(r.id, { refB })} />
++                <LengthField label="מרחק" valueM={r.distB} unit={unit} onCommit={(distB) => onPatch(r.id, { distB })} />
++              </div>
++            )}
++            {r.kind === 'alignTo' && (
++              <div className="grid grid-cols-2 gap-1">
++                <Select label="יישור לפי" value={r.ref} options={FACE_OPTIONS} onChange={(ref) => onPatch(r.id, { ref })} />
++                <LengthField label="מרווח" valueM={r.gapM} unit={unit} onCommit={(gapM) => onPatch(r.id, { gapM })} />
++              </div>
++            )}
++            {r.kind === 'roofOverhang' && <LengthField label="בליטה מפני הקיר החיצוני" valueM={r.overhangM} unit={unit} min={0} onCommit={(overhangM) => onPatch(r.id, { overhangM })} />}
++            {r.kind === 'divide' && (
++              <div className="grid grid-cols-2 gap-1">
++                <Select label="חלוקה לפי" value={r.by} options={[{ v: 'count', he: 'מספר (שווה)' }, { v: 'spacing', he: 'מרווח קבוע' }]} onChange={(by) => onPatch(r.id, { by })} />
++                {r.by === 'spacing' && <LengthField label="מרווח" valueM={r.spacingM ?? 1} unit={unit} min={0.01} onCommit={(spacingM) => onPatch(r.id, { spacingM })} />}
++              </div>
++            )}
++          </div>
++        )
++      })}
++    </div>
++  )
++}
++
++// ---------------------------------------------------------------------------
++// LAYERS
++// ---------------------------------------------------------------------------
++
++const LAYER_HE: Record<LayerKey, string> = {
++  wallExt: 'קירות חוץ',
++  wallInt: 'קירות פנים',
++  column: 'עמודים',
++  beam: 'קורות',
++  opening: 'פתחים',
++  roof: 'גג',
++  aux: 'קווי עזר וצירים',
++  dims: 'מידות',
++  constraints: 'סימוני יחסים',
++}
++
++export function LayersPanel({ doc, onSet }: { doc: SketchDoc; onSet: (key: LayerKey, patch: { visible?: boolean; locked?: boolean }) => void }) {
++  return (
++    <div className={panelCls}>
++      <div className="mb-1 text-xs font-medium">שכבות — הצגה ונעילה</div>
++      <div className="space-y-0.5">
++        {LAYER_KEYS.map((k) => {
++          const l = doc.layers[k]
++          const lockable = k !== 'dims' && k !== 'constraints'
++          return (
++            <div key={k} className="flex items-center gap-1 text-xs">
++              <button type="button" className="rounded p-0.5 hover:bg-surface-2" title={l.visible ? 'הסתר' : 'הצג'} onClick={() => onSet(k, { visible: !l.visible })}>{l.visible ? <Eye size={13} /> : <EyeOff size={13} />}</button>
++              {lockable ? (
++                <button type="button" className="rounded p-0.5 hover:bg-surface-2" title={l.locked ? 'שחרר' : 'נעל (לא יזוז)'} onClick={() => onSet(k, { locked: !l.locked })}>{l.locked ? <Lock size={13} /> : <LockOpen size={13} />}</button>
++              ) : <span className="w-[22px]" />}
++              <span className={l.visible ? '' : 'text-muted'}>{LAYER_HE[k]}</span>
++            </div>
++          )
++        })}
++      </div>
++    </div>
++  )
++}
++
++// ---------------------------------------------------------------------------
++// ROOF
++// ---------------------------------------------------------------------------
++
++export function RoofPanel({ doc, derivation, slopePct, onSlope, onBuild, buildLabel }: {
++  doc: SketchDoc
++  derivation: RoofDerivationResult
++  slopePct: number
++  onSlope: (v: number) => void
++  onBuild: () => void
++  buildLabel: string
++}) {
++  return (
++    <div className={panelCls + ' space-y-2'}>
++      <div className="text-xs font-medium">חיבור למודל הגג</div>
++      {derivation.ok ? (
++        <>
++          <div className="text-[11px] text-muted">
++            מקור המתאר: {derivation.source === 'roofOutline' ? 'מתאר גג משורטט' : 'פני החוץ של קירות החוץ'} · {derivation.ring.length} פינות
++          </div>
++          <div className="text-[11px]">הגג נשען על: <span className="text-fg">{supportNames(doc, derivation.supports).join(', ') || '—'}</span></div>
++          <div className="text-[10px] text-muted">סימון «נושא» מתעד את כוונת המשתמש; אינו אישור הנדסי לכושר נשיאה.</div>
++        </>
++      ) : (
++        <div className="text-[11px] text-danger">{derivation.message}</div>
++      )}
++      <NumberField label="שיפוע הגג" value={slopePct} suffix="%" onCommit={onSlope} />
++      <button type="button" disabled={!derivation.ok} className="min-h-[36px] w-full rounded-md bg-brand px-3 text-xs font-medium text-white hover:bg-brand-dark disabled:opacity-50" onClick={onBuild}>{buildLabel}</button>
++    </div>
++  )
++}
+diff --git a/src/parametric/ui/snap.ts b/src/parametric/ui/snap.ts
+new file mode 100644
+index 0000000..5229f85
+--- /dev/null
++++ b/src/parametric/ui/snap.ts
+@@ -0,0 +1,114 @@
++// src/parametric/ui/snap.ts
++// Snapping for the parametric canvas (owner brief §5 "הצמדות"): existing
++// points, intersections, midpoints, any point along a line (with a
++// horizontal/vertical alignment to the draft's anchor), and the grid.
++// Pure: meters in, meters out; pixel tolerances are converted by the caller.
++import type { Pt, SketchDoc } from '../model'
++import { closestOnSegment, dist, lineIntersection, mid } from '../geom'
++
++export type SnapKind = 'point' | 'intersection' | 'midpoint' | 'on-line' | 'axis' | 'grid' | 'free'
++
++export interface Snap {
++  point: Pt
++  kind: SnapKind
++  /** Existing point id when kind === 'point'. */
++  pointId?: string
++  /** Line id when kind === 'on-line' / 'midpoint'. */
++  lineId?: string
++  /** Inferred axis relation vs the anchor (while drawing). */
++  axis?: 'horizontal' | 'vertical'
++}
++
++export interface SnapOptions {
++  /** Snap radius in meters (pixels / pxPerM). */
++  radiusM: number
++  gridM: number | null
++  /** Point ids to ignore (the dragged ones). */
++  exclude?: ReadonlySet<string>
++  /** The draft line's first point, for axis inference. */
++  anchor?: Pt
++  /** Hidden lines (by id) are not snapped to. */
++  hiddenLines?: ReadonlySet<string>
++}
++
++export function snapPoint(doc: SketchDoc, positions: ReadonlyMap<string, Pt>, target: Pt, o: SnapOptions): Snap {
++  const r = o.radiusM
++  const segs = doc.lines
++    .filter((l) => !o.hiddenLines?.has(l.id))
++    .map((l) => ({ id: l.id, a: positions.get(l.a), b: positions.get(l.b) }))
++    .filter((s): s is { id: string; a: Pt; b: Pt } => !!s.a && !!s.b)
++
++  // 1. existing points
++  let best: { d: number; snap: Snap } | null = null
++  for (const p of doc.points) {
++    if (o.exclude?.has(p.id)) continue
++    const q = positions.get(p.id) ?? p
++    const d = dist(q, target)
++    if (d <= r && (!best || d < best.d)) best = { d, snap: { point: { x: q.x, y: q.y }, kind: 'point', pointId: p.id } }
++  }
++  if (best) return best.snap
++
++  // 2. intersections
++  for (let i = 0; i < segs.length; i++) {
++    for (let j = i + 1; j < segs.length; j++) {
++      const x = lineIntersection(segs[i]!.a, segs[i]!.b, segs[j]!.a, segs[j]!.b)
++      if (!x) continue
++      // only inside both segments (with tolerance)
++      const onI = dist(closestOnSegment(x, segs[i]!.a, segs[i]!.b), x) < 1e-6
++      const onJ = dist(closestOnSegment(x, segs[j]!.a, segs[j]!.b), x) < 1e-6
++      if (!onI || !onJ) continue
++      const d = dist(x, target)
++      if (d <= r && (!best || d < best.d)) best = { d, snap: { point: x, kind: 'intersection' } }
++    }
++  }
++  if (best) return best.snap
++
++  // 3. midpoints
++  for (const s of segs) {
++    const m = mid(s.a, s.b)
++    const d = dist(m, target)
++    if (d <= r && (!best || d < best.d)) best = { d, snap: { point: m, kind: 'midpoint', lineId: s.id } }
++  }
++  if (best) return best.snap
++
++  // 4. axis alignment with the anchor (horizontal / vertical)
++  let axisSnap: Snap | null = null
++  if (o.anchor) {
++    const dx = Math.abs(target.x - o.anchor.x)
++    const dy = Math.abs(target.y - o.anchor.y)
++    if (dy <= r && dx > dy) axisSnap = { point: { x: target.x, y: o.anchor.y }, kind: 'axis', axis: 'horizontal' }
++    else if (dx <= r && dy >= dx) axisSnap = { point: { x: o.anchor.x, y: target.y }, kind: 'axis', axis: 'vertical' }
++  }
++
++  // 5. on a line (closest point) — combined with the axis when both apply
++  for (const s of segs) {
++    const c = closestOnSegment(target, s.a, s.b)
++    const d = dist(c, target)
++    if (d <= r && (!best || d < best.d)) {
++      let point = c
++      if (axisSnap) {
++        // intersect the axis line with the segment's line for an exact corner
++        const axisB = axisSnap.axis === 'horizontal' ? { x: o.anchor!.x + 1, y: o.anchor!.y } : { x: o.anchor!.x, y: o.anchor!.y + 1 }
++        const x = lineIntersection(o.anchor!, axisB, s.a, s.b)
++        if (x && dist(x, target) <= r * 1.5) point = x
++      }
++      best = { d, snap: { point, kind: 'on-line', lineId: s.id, ...(axisSnap && point !== c ? { axis: axisSnap.axis } : {}) } }
++    }
++  }
++  if (best) return best.snap
++  if (axisSnap) {
++    if (o.gridM) {
++      const g = o.gridM
++      const p = axisSnap.point
++      axisSnap.point = axisSnap.axis === 'horizontal' ? { x: Math.round(p.x / g) * g, y: p.y } : { x: p.x, y: Math.round(p.y / g) * g }
++    }
++    return axisSnap
++  }
++
++  // 6. grid
++  if (o.gridM) {
++    const g = o.gridM
++    return { point: { x: Math.round(target.x / g) * g, y: Math.round(target.y / g) * g }, kind: 'grid' }
++  }
++  return { point: target, kind: 'free' }
++}
+-- 
+2.43.0
+

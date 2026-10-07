@@ -1,0 +1,419 @@
+From 5529a2f564c348bb0c008e63b9472e4a047f0c4b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 21:19:58 +0000
+Subject: [PATCH 3/3] =?UTF-8?q?parametric:=20wire=20the=20sketcher=20into?=
+ =?UTF-8?q?=20the=20roof=20wizard=20=E2=80=94=20RoofModel.parametricSketch?=
+ =?UTF-8?q?=20(persisted),=20adoptParametricSketch/setParametricSketch=20a?=
+ =?UTF-8?q?ctions,=20step-02=20entry,=20chained-wall=20corner=20sharing,?=
+ =?UTF-8?q?=20column=20hit?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/parametric/ui/ParametricSketcher.tsx |  15 +++-
+ src/parametric/ui/hit.ts                 |   9 +-
+ src/roofwizard/RoofWizard.tsx            |  76 ++++++++++++++++
+ src/roofwizard/history.ts                |   2 +-
+ src/roofwizard/parametricAdopt.test.ts   | 107 +++++++++++++++++++++++
+ src/roofwizard/persist.ts                |   4 +
+ src/roofwizard/state.ts                  |  41 +++++++++
+ src/roofwizard/types.ts                  |  15 ++++
+ 8 files changed, 264 insertions(+), 5 deletions(-)
+ create mode 100644 src/roofwizard/parametricAdopt.test.ts
+
+diff --git a/src/parametric/ui/ParametricSketcher.tsx b/src/parametric/ui/ParametricSketcher.tsx
+index ff97fb1..bd4442c 100644
+--- a/src/parametric/ui/ParametricSketcher.tsx
++++ b/src/parametric/ui/ParametricSketcher.tsx
+@@ -264,9 +264,18 @@ export function ParametricSketcher({ initialDoc, onChange, onClose, onBuildRoof,
+     const ang = Math.abs((Math.atan2(d.y, d.x) * 180) / Math.PI)
+     if (end.axis === 'horizontal' || ang < 1.5 || ang > 178.5) auto.push('horizontal')
+     else if (end.axis === 'vertical' || Math.abs(ang - 90) < 1.5) auto.push('vertical')
+-    dispatch({ kind: 'addLine', a, b, auto, as: objectSpecFor(tool), construction: tool === 'aux' })
+-    // Chain: the next line starts where this one ended.
+-    setDraftStart({ point: end.point, kind: end.kind, pointId: end.pointId })
++    // Settle synchronously so the chain can continue from the NEW end point's
++    // id (a chained wall must share its corner point with the previous wall —
++    // otherwise the loop never closes and the roof cannot be derived).
++    const action: SketchAction = { kind: 'addLine', a, b, auto, as: objectSpecFor(tool), construction: tool === 'aux' }
++    const next = sketchReducer(doc, action)
++    if (next === doc) return
++    dispatch({ kind: 'commitDoc', doc: next })
++    const known = new Set(doc.points.map((p) => p.id))
++    const newLine = next.lines[next.lines.length - 1]!
++    const endId = end.pointId ?? (known.has(newLine.b) ? newLine.b : newLine.b)
++    const endPt = pointById(next, endId) ?? end.point
++    setDraftStart({ point: { x: endPt.x, y: endPt.y }, kind: 'point', pointId: endId })
+     setTyped('')
+   }
+ 
+diff --git a/src/parametric/ui/hit.ts b/src/parametric/ui/hit.ts
+index 56497e8..f6d1d87 100644
+--- a/src/parametric/ui/hit.ts
++++ b/src/parametric/ui/hit.ts
+@@ -37,7 +37,14 @@ export function hitTest(doc: SketchDoc, positions: ReadonlyMap<string, Pt>, p: P
+     const d = dist(q, p)
+     if (d <= tolM && (!best || d < best.d)) best = { d, hit: { type: 'point', id: pt.id } }
+   }
+-  if (best) return best.hit
++  if (best) {
++    // A column's center point IS the column: selecting/dragging it means the
++    // column (its properties, its relations) — never a bare point.
++    const pid = best.hit.type === 'point' ? best.hit.id : null
++    const col = pid ? doc.objects.find((o) => o.kind === 'column' && o.point === pid && visibleLayer(o)) : undefined
++    if (col) return { type: 'object', id: col.id, object: col }
++    return best.hit
++  }
+   // Object bodies (openings before walls: they sit on top).
+   const ordered = [...doc.objects].sort((a, b) => rank(a) - rank(b))
+   for (const o of ordered) {
+diff --git a/src/roofwizard/RoofWizard.tsx b/src/roofwizard/RoofWizard.tsx
+index fcd02ac..531af3b 100644
+--- a/src/roofwizard/RoofWizard.tsx
++++ b/src/roofwizard/RoofWizard.tsx
+@@ -40,6 +40,13 @@ const Roof3DView = lazy(() => import('../roof3d/Roof3DView').then((m) => ({ defa
+ const ProductionReportView = lazy(() =>
+   import('./report/ProductionReportView').then((m) => ({ default: m.ProductionReportView })),
+ )
++// PARAMETRIC SKETCHER (owner brief 2026-10-07): the full-screen parametric
++// plan environment (src/parametric). Lazy — opened on demand from step 02.
++const ParametricSketcher = lazy(() =>
++  import('../parametric/ui/ParametricSketcher').then((m) => ({ default: m.ParametricSketcher })),
++)
++import { restoreDoc as restoreSketchDoc } from '../parametric/persist'
++import { emptyDoc as emptySketchDoc, type SketchDoc } from '../parametric/model'
+ // Type-only — erased at compile time, so this does NOT pull `three` into the
+ // eager bundle (same doctrine as the `Roof3DView` lazy import's own comment
+ // above): only the imperative-handle SHAPE is needed here for the "בית"
+@@ -327,6 +334,17 @@ export function RoofWizard({
+   const [step4MoreOpen, setStep4MoreOpen] = useState(false)
+   // PRODUCTION REPORT overlay (see the lazy import + button below).
+   const [reportOpen, setReportOpen] = useState(false)
++  // PARAMETRIC SKETCHER overlay (brief §5: a fixed full-screen workspace).
++  const [sketcherInitial, setSketcherInitial] = useState<SketchDoc | null>(null)
++  const [sketcherWarning, setSketcherWarning] = useState<string | null>(null)
++  const openSketcher = () => {
++    // Same doctrine as restoreSnapshot: an unreadable saved sketch is
++    // reported, never silently replaced (the raw field stays on the model
++    // until the user saves a new sketch over it).
++    const r = restoreSketchDoc(model.parametricSketch)
++    if (!r.ok) setSketcherWarning(r.message)
++    setSketcherInitial(r.ok ? r.doc : emptySketchDoc())
++  }
+   // OWNER SPEC #9 ("יש חוקים ששבורים" becomes a disclosure with jump-to-
+   // region): the banner's primary click now TOGGLES this inline list instead
+   // of navigating away — see the banner's own doc below. A row without
+@@ -1101,6 +1119,27 @@ export function RoofWizard({
+       case 2:
+         return (
+           <div dir="rtl" className={`flex w-full flex-col gap-3 lg:shrink-0 ${pinned.sideColumnWidth}${sideScrollCls}`}>
++            {/* PARAMETRIC SKETCHER entry (owner brief 2026-10-07): walls /
++                columns / beams with dimensions + relations, then build the
++                roof from it. The sketch persists on the model whether or not
++                a roof was built from it. */}
++            <div className={card + ' space-y-1 p-2'}>
++              <button
++                type="button"
++                onClick={openSketcher}
++                className="min-h-touch w-full rounded-lg border border-brand bg-brand px-3 text-sm text-white transition-colors hover:opacity-90"
++                data-testid="open-parametric-sketcher"
++              >
++                שרטוט פרמטרי — קירות, עמודים, קורות
++              </button>
++              <div className="text-[11px] text-muted">
++                {model.parametricSketch
++                  ? `שרטוט שמור: ${model.parametricSketch.objects.length} אובייקטים · ${model.parametricSketch.constraints.length + model.parametricSketch.relations.length} יחסים` +
++                    (model.parametricSketch.roofSupports && model.parametricSketch.roofSupports.length > 0 ? ` · הגג נשען על ${model.parametricSketch.roofSupports.length} רכיבים` : '')
++                  : 'שרטט מתאר עם מידות ויחסים, ובנה ממנו את הגג'}
++              </div>
++              {sketcherWarning && <div className="text-[11px] text-danger">{sketcherWarning}</div>}
++            </div>
+             <GeometryPanel {...geometryPanelCommon} sections={['primaryDims']} />
+             <EdgeListPanel
+               contour={model.contour}
+@@ -1507,6 +1546,43 @@ export function RoofWizard({
+           <ProductionReportView model={model} onClose={() => setReportOpen(false)} />
+         </Suspense>
+       )}
++      {/* PARAMETRIC SKETCHER overlay — the sketch document lives on
++          model.parametricSketch (persisted with the roof snapshot via the
++          normal draft autosave); 'setParametricSketch' is transparent in the
++          wizard's undo ring (the sketcher has its own). Building the roof
++          goes through 'adoptParametricSketch' (state.ts) — the same free-
++          contour path as a DXF import — after the same pre-replace history
++          snapshot every other destructive contour write takes. */}
++      {sketcherInitial !== null && (
++          <Suspense fallback={null}>
++            <ParametricSketcher
++              initialDoc={sketcherInitial}
++              initialSlopePct={model.slopePct}
++              roofExists={replacesExistingRoof}
++              title={breadcrumb && breadcrumb.length > 0 ? `שרטוט פרמטרי · ${breadcrumb[breadcrumb.length - 1]}` : 'שרטוט פרמטרי'}
++              onChange={(doc) => dispatch({ kind: 'setParametricSketch', doc })}
++              onClose={() => setSketcherInitial(null)}
++              onBuildRoof={({ doc, derivation }) => {
++                if (derivation.ring.length < 4) {
++                  setSketcherWarning('מתאר הגג צריך לפחות ארבע פינות כדי להיבנות במנוע הגג')
++                  return
++                }
++                if (replacesExistingRoof) onHistorySnapshot?.(toSnapshot(model, restored.carry), 'לפני בניית גג מהשרטוט')
++                dispatch({
++                  kind: 'adoptParametricSketch',
++                  doc,
++                  contour: derivation.ring,
++                  edgeOverhangM: derivation.edgeOverhangM,
++                  slopePct: doc.roofSlopePct,
++                })
++                setSelectedEdge(null)
++                setSelectedIds([])
++                setSketcherWarning(null)
++                setSketcherInitial(null)
++              }}
++            />
++          </Suspense>
++      )}
+ 
+       {/* GLOBAL — unaffected by which step is active, same as before STAGE
+           W1: the hidden DXF file input (its visible trigger is the tile in
+diff --git a/src/roofwizard/history.ts b/src/roofwizard/history.ts
+index 7a6dfd1..2129a66 100644
+--- a/src/roofwizard/history.ts
++++ b/src/roofwizard/history.ts
+@@ -106,5 +106,5 @@ export function undoable<S, A extends { kind: string }>(
+  *  (closing an error banner is not an edit to step back over). */
+ export const undoableRoofReducer = undoable<RoofModel, RoofAction>(
+   roofReducer,
+-  (a) => a.kind === 'engineReady' || a.kind === 'dismissError',
++  (a) => a.kind === 'engineReady' || a.kind === 'dismissError' || a.kind === 'setParametricSketch',
+ )
+diff --git a/src/roofwizard/parametricAdopt.test.ts b/src/roofwizard/parametricAdopt.test.ts
+new file mode 100644
+index 0000000..b6dd2b2
+--- /dev/null
++++ b/src/roofwizard/parametricAdopt.test.ts
+@@ -0,0 +1,107 @@
++// PARAMETRIC SKETCH ↔ ROOF MODEL integration (owner brief 2026-10-07 §6/§7):
++// the sketch document persists on the roof snapshot, and building the roof
++// from the sketch adopts its footprint through the free-walls path, keeping
++// edge kinds + applying per-edge overhang requests.
++import { beforeAll, describe, expect, it } from 'vitest'
++import { emptyDoc, type SketchDoc } from '../parametric/model'
++import { sketchReducer } from '../parametric/doc'
++import { deriveRoof } from '../parametric/roofBridge'
++import { restoreSnapshot, toSnapshot } from './persist'
++import { initRoofModel, roofReducer } from './state'
++import { initEngine } from './engine/skeleton'
++import { undoableRoofReducer } from './history'
++import { initHistory } from './history'
++
++function sketchWithBuilding(): SketchDoc {
++  let d = emptyDoc()
++  const add = (a: { x: number; y: number } | { pointId: string }, b: { x: number; y: number } | { pointId: string }, auto: 'horizontal' | 'vertical') => {
++    d = sketchReducer(d, { kind: 'addLine', a, b, auto: [auto], as: { kind: 'wall', wallType: 'exterior', lineIs: 'faceB' } })
++  }
++  add({ x: 0, y: 0 }, { x: 10, y: 0 }, 'horizontal')
++  add({ pointId: d.lines[0]!.b }, { x: 10, y: 6 }, 'vertical')
++  add({ pointId: d.lines[1]!.b }, { x: 0, y: 6 }, 'horizontal')
++  add({ pointId: d.lines[2]!.b }, { pointId: d.lines[0]!.a }, 'vertical')
++  const w1 = d.objects[0]!.id
++  d = sketchReducer(d, { kind: 'addLine', a: { x: -1, y: -0.6 }, b: { x: 11, y: -0.6 }, as: { kind: 'roofEdge', edgeType: 'eave' } })
++  const edge = d.objects[d.objects.length - 1]!.id
++  d = sketchReducer(d, { kind: 'addRelation', relation: { kind: 'roofOverhang', roofEdge: edge, wall: w1, overhangM: 0.6 } })
++  return d
++}
++
++describe('adoptParametricSketch', () => {
++  beforeAll(async () => {
++    await initEngine()
++  })
++
++  it('stores the sketch and adopts the derived footprint as a free contour with per-edge overhangs', () => {
++    const doc = sketchWithBuilding()
++    const der = deriveRoof(doc)
++    expect(der.ok).toBe(true)
++    if (!der.ok) return
++    const m0 = roofReducer(initRoofModel('gable'), { kind: 'engineReady' })
++    const m1 = roofReducer(m0, { kind: 'adoptParametricSketch', doc, contour: der.ring, edgeOverhangM: der.edgeOverhangM, slopePct: 35 })
++    expect(m1.parametricSketch).toBe(doc)
++    expect(m1.templateId).toBe('free')
++    expect(m1.freeWalls?.length).toBe(4)
++    expect(m1.contour.length).toBe(4)
++    expect(m1.slopePct).toBe(35)
++    // Outer-face ring: the sketch lines ARE the outer faces (lineIs faceB on a CCW loop) → 10 × 6.
++    const xs = m1.contour.map((p) => p.x)
++    const ys = m1.contour.map((p) => p.y)
++    expect(Math.max(...xs) - Math.min(...xs)).toBeCloseTo(10, 6)
++    expect(Math.max(...ys) - Math.min(...ys)).toBeCloseTo(6, 6)
++    // The overhang request landed on exactly one edge; the others keep the global default.
++    const overs = (m1.edgeAttrs ?? []).map((e) => e.overhangM)
++    expect(overs.filter((o) => Math.abs(o - 0.6) < 1e-9).length).toBe(1)
++    expect(overs.filter((o) => Math.abs(o - m0.overhangM) < 1e-9).length).toBe(3)
++    expect(m1.centerlines.length).toBeGreaterThan(0)
++  })
++
++  it('keeps eave/gable kinds across a re-adopt with the same wall count', () => {
++    const doc = sketchWithBuilding()
++    const der = deriveRoof(doc)
++    if (!der.ok) throw new Error('derivation failed')
++    let m = roofReducer(initRoofModel('gable'), { kind: 'engineReady' })
++    m = roofReducer(m, { kind: 'adoptParametricSketch', doc, contour: der.ring, edgeOverhangM: der.edgeOverhangM })
++    // Make a SHORT end (6 m) a gable — a triangular end face the engine
++    // keeps realizing after the long side is widened.
++    const n = m.contour.length
++    const gableEdge = m.contour.findIndex((p, k) => {
++      const q = m.contour[(k + 1) % n]!
++      return Math.abs(Math.hypot(q.x - p.x, q.y - p.y) - 6) < 1e-6
++    })
++    expect(gableEdge).toBeGreaterThanOrEqual(0)
++    m = roofReducer(m, { kind: 'setEdgeKind', edgeIndex: gableEdge, value: 'gable' })
++    expect(m.edgeAttrs?.[gableEdge]?.kind).toBe('gable')
++    // Widen the sketch, re-adopt: same edge count, the gable survives.
++    const lenLine = doc.lines[0]!.id
++    const wider = sketchReducer(sketchReducer(doc, { kind: 'addConstraint', c: { kind: 'fixed', p: doc.lines[0]!.a, x: 0, y: 0 } }), {
++      kind: 'addDimension',
++      dim: { kind: 'length', refs: [lenLine], driving: true },
++      value: 14,
++    })
++    const der2 = deriveRoof(wider)
++    if (!der2.ok) throw new Error('derivation failed')
++    const m2 = roofReducer(m, { kind: 'adoptParametricSketch', doc: wider, contour: der2.ring, edgeOverhangM: der2.edgeOverhangM })
++    expect(m2.edgeAttrs?.[gableEdge]?.kind).toBe('gable')
++    const xs = m2.contour.map((p) => p.x)
++    expect(Math.max(...xs) - Math.min(...xs)).toBeCloseTo(14, 6)
++  })
++
++  it('round-trips through the roof snapshot and is transparent in the wizard undo ring', () => {
++    const doc = sketchWithBuilding()
++    const m = roofReducer(initRoofModel('gable'), { kind: 'setParametricSketch', doc })
++    const snap = toSnapshot(m)
++    const back = restoreSnapshot(snap)
++    expect(back.model?.parametricSketch?.objects.length).toBe(doc.objects.length)
++    expect(back.model?.parametricSketch?.relations.length).toBe(1)
++    // Transparent: no undo step for a sketch autosave.
++    const h0 = initHistory(initRoofModel('gable'))
++    const h1 = undoableRoofReducer(h0, { kind: 'setParametricSketch', doc })
++    expect(h1.past.length).toBe(0)
++    expect(h1.present.parametricSketch).toBe(doc)
++    // A snapshot with a corrupt sketch field is refused as a whole (shape guard).
++    const bad = { ...snap, model: { ...snap.model, parametricSketch: 'nope' } }
++    expect(restoreSnapshot(bad).model).toBeNull()
++  })
++})
+diff --git a/src/roofwizard/persist.ts b/src/roofwizard/persist.ts
+index 2729ec9..187d2a5 100644
+--- a/src/roofwizard/persist.ts
++++ b/src/roofwizard/persist.ts
+@@ -123,6 +123,10 @@ function isRoofModel(x: unknown): x is RoofModel {
+   // is checked here; a stale/non-matching id inside it is inert by
+   // construction (see the RoofModel doc), never a structural failure.
+   if (x.removedOptionalRafterIds !== undefined && !Array.isArray(x.removedOptionalRafterIds)) return false
++  // PARAMETRIC SKETCH (2026-10-07): optional additive field — shape-only
++  // here; parametric/persist.ts's restoreDoc validates the document itself
++  // when the sketcher opens (and reports, never silently discards).
++  if (x.parametricSketch !== undefined && !isObj(x.parametricSketch)) return false
+   // ROOF OPENINGS + TECHNICAL ZONE + TRUSSES (Alik 03/08/2026): optional
+   // additive fields — a snapshot without them is fully valid (same doctrine
+   // as layerEnabled/manualQtyOverrides above); when present, only the shape
+diff --git a/src/roofwizard/state.ts b/src/roofwizard/state.ts
+index 0b55a9a..622c354 100644
+--- a/src/roofwizard/state.ts
++++ b/src/roofwizard/state.ts
+@@ -30,6 +30,7 @@ import { computeGrayFrame } from './grayFrame'
+ import { rectPolygonIntersectionArea, roofAreaFromContour } from './geometry'
+ import { MIN_ROOF_DIM_M, MIN_SLOPE_PCT } from './viewModeKeys'
+ import { isEngineReady } from './engine/skeleton'
++import type { SketchDoc } from '../parametric/model'
+ 
+ // INPUT GUARD for the setDims patch (QA 16/09/2026 — negative/zero slope and
+ // dims were accepted and priced). Same bounds the NumberFields enforce
+@@ -1934,6 +1935,21 @@ export type RoofAction =
+   | { kind: 'setTrussCount'; value: number | undefined }
+   // === END ROOF OPENINGS + TECHNICAL ZONE + TRUSSES ACTIONS ===
+   | { kind: 'dismissError' }
++  /** PARAMETRIC SKETCH: store the sketch document (autosave from the
++   *  sketcher). Never touches the roof geometry. Transparent in the undo
++   *  ring (history.ts) — the sketcher has its own undo/redo. */
++  | { kind: 'setParametricSketch'; doc: SketchDoc }
++  /** PARAMETRIC SKETCH → ROOF (brief §6): adopt the sketch's derived
++   *  footprint as a FREE contour (same path as a guideless DXF import),
++   *  carrying per-edge overhang requests and the sketch's slope. Edge kinds
++   *  (eave/gable) survive when the wall count is unchanged. */
++  | {
++      kind: 'adoptParametricSketch'
++      doc: SketchDoc
++      contour: Point[]
++      edgeOverhangM?: (number | null)[]
++      slopePct?: number
++    }
+   | { kind: 'engineReady' }
+   // ROOF SNAPSHOTS (safety net, 2026-09-04 incident): replace the live model
+   // wholesale with a PREVIOUSLY validated one (RoofWizard.tsx's "שחזר" —
+@@ -3536,6 +3552,31 @@ export function roofReducer(m: RoofModel, a: RoofAction): RoofModel {
+       return { ...m, trussCount: Math.round(a.value) }
+     }
+     // === END ROOF OPENINGS + TECHNICAL ZONE + TRUSSES REDUCER CASES ===
++    case 'setParametricSketch':
++      return m.parametricSketch === a.doc ? m : { ...m, parametricSketch: a.doc }
++    case 'adoptParametricSketch': {
++      if (a.contour.length < 4) return { ...m, parametricSketch: a.doc }
++      const prevEdgeAttrs = m.templateId === 'free' ? m.edgeAttrs : undefined
++      const withDoc: RoofModel = { ...m, parametricSketch: a.doc }
++      const adopted = roofReducer(withDoc, { kind: 'importBuilding', contour: a.contour })
++      if (adopted === withDoc) return withDoc
++      const n = adopted.contour.length
++      const edgeAttrs = (adopted.edgeAttrs ?? []).map((e, k) => {
++        const kept = prevEdgeAttrs && prevEdgeAttrs.length === n ? prevEdgeAttrs[k] : undefined
++        const over = a.edgeOverhangM?.[k]
++        // A sketch overhang request is a USER value on that edge (T7's
++        // overhangUser — regenerate() keeps it verbatim); otherwise a kept
++        // per-edge user value survives, else the global/per-side fallback.
++        const user = typeof over === 'number' && Number.isFinite(over) && over >= 0 ? over : kept?.overhangUser
++        return {
++          ...e,
++          ...(kept ? { kind: kept.kind } : {}),
++          ...(user !== undefined ? { overhangM: user, overhangUser: user } : {}),
++        }
++      })
++      const slopePct = a.slopePct !== undefined && Number.isFinite(a.slopePct) && a.slopePct >= MIN_SLOPE_PCT ? a.slopePct : adopted.slopePct
++      return regenerate({ ...adopted, edgeAttrs, slopePct, parametricSketch: a.doc })
++    }
+     case 'dismissError':
+       // PR-F (c): close the regeneration-failure banner. Geometry untouched.
+       return m.regenError === undefined ? m : { ...m, regenError: undefined }
+diff --git a/src/roofwizard/types.ts b/src/roofwizard/types.ts
+index 309ec03..80bd518 100644
+--- a/src/roofwizard/types.ts
++++ b/src/roofwizard/types.ts
+@@ -6,6 +6,7 @@ import type { RoofSectionId } from './protocols/roofSections.seed'
+ import type { VergeBoardMethod, VergeBoardThicknessMm } from './layerThickness'
+ import type { SketchLine } from './sketch/types'
+ import type { SketchRelation } from './tools/relations/types'
++import type { SketchDoc } from '../parametric/model'
+ 
+ /** 'free' (Alik 2026-08-17) is the sixth option, for outlines the five fixed
+  *  templates cannot describe. Its contour is derived from RoofModel.freeWalls
+@@ -1126,6 +1127,20 @@ export interface RoofModel {
+    * normal `{...m, ...}` spread like every other untouched RoofModel field).
+    */
+   removedOptionalRafterIds?: string[]
++  /**
++   * PARAMETRIC SKETCH (owner brief 2026-10-07 — "סביבת שרטוט פרמטרית"): the
++   * block's parametric plan (walls / columns / beams / openings / roof
++   * edges, their constraints, driving + reference dimensions and structural
++   * relations — src/parametric/model.ts). Persisted with the roof snapshot
++   * so it survives close/reopen (brief §4). The roof CONTOUR is derived from
++   * it only when the user explicitly builds/updates the roof from the
++   * sketch ('adoptParametricSketch') — editing the sketch never silently
++   * regenerates the roof. Absent on every pre-existing snapshot (purely
++   * additive); `roofSupports` inside it records which sketch objects the
++   * roof was declared to rest on (brief §6 — the user's intent, never an
++   * engineering approval).
++   */
++  parametricSketch?: SketchDoc
+ }
+ 
+ /**
+-- 
+2.43.0
+

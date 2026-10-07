@@ -1,0 +1,2990 @@
+From 02c837fcc1e57fccfffbaefc037ff37e887c8be2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 20:59:41 +0000
+Subject: [PATCH 1/3] parametric: core model, constraint solver, DOF/conflict
+ analysis, objects, relations, doc ops, persistence, roof bridge
+
+---
+ src/parametric/analysis.ts      | 120 +++++++
+ src/parametric/doc.ts           | 619 ++++++++++++++++++++++++++++++++
+ src/parametric/geom.ts          |  81 +++++
+ src/parametric/linalg.ts        | 107 ++++++
+ src/parametric/model.ts         | 475 ++++++++++++++++++++++++
+ src/parametric/objects.ts       | 136 +++++++
+ src/parametric/persist.ts       |  68 ++++
+ src/parametric/relations.ts     | 189 ++++++++++
+ src/parametric/roofBridge.ts    | 197 ++++++++++
+ src/parametric/scenario.test.ts | 295 +++++++++++++++
+ src/parametric/solver.test.ts   | 163 +++++++++
+ src/parametric/solver.ts        | 432 ++++++++++++++++++++++
+ 12 files changed, 2882 insertions(+)
+ create mode 100644 src/parametric/analysis.ts
+ create mode 100644 src/parametric/doc.ts
+ create mode 100644 src/parametric/geom.ts
+ create mode 100644 src/parametric/linalg.ts
+ create mode 100644 src/parametric/model.ts
+ create mode 100644 src/parametric/objects.ts
+ create mode 100644 src/parametric/persist.ts
+ create mode 100644 src/parametric/relations.ts
+ create mode 100644 src/parametric/roofBridge.ts
+ create mode 100644 src/parametric/scenario.test.ts
+ create mode 100644 src/parametric/solver.test.ts
+ create mode 100644 src/parametric/solver.ts
+
+diff --git a/src/parametric/analysis.ts b/src/parametric/analysis.ts
+new file mode 100644
+index 0000000..a8ee7a4
+--- /dev/null
++++ b/src/parametric/analysis.ts
+@@ -0,0 +1,120 @@
++// src/parametric/analysis.ts
++// DEGREES-OF-FREEDOM + CONFLICT ANALYSIS (owner brief §4: "להציג מה עדיין
++// חופשי לזוז ומה מוגדר במלואו … לזהות אילוצים סותרים ולהדגיש את האובייקטים
++// והיחסים המעורבים"). Pure. Works on the solver's compiled system at the
++// CURRENT positions:
++//   - rank of the Jacobian → remaining DOF (n − rank);
++//   - null space → which POINTS can still move (any nonzero component);
++//   - row dependence → REDUNDANT constraints (consistent but over-defining);
++//   - solver residuals → CONFLICTING constraints (cannot all hold).
++import type { Pt, SketchDoc } from './model'
++import { constraintRefs, lineById, objectLineIds, objectPointIds } from './model'
++import { nullSpace, rref, transpose } from './linalg'
++import { compile, jacobian, type SolveResult } from './solver'
++
++export type ConstraintStatus = 'ok' | 'redundant' | 'conflict'
++
++export interface SketchAnalysis {
++  /** Remaining degrees of freedom of the whole sketch (rigid-body motions
++   *  included — an unpinned sketch always keeps at least 3 until a point is
++   *  fixed). */
++  dof: number
++  /** Point ids that can still move. */
++  freePoints: Set<string>
++  /** Point ids that are fully defined. */
++  definedPoints: Set<string>
++  status: Map<string, ConstraintStatus>
++  /** Constraint ids in conflict (from the solve). */
++  conflicts: string[]
++  /** Constraint ids that are redundant (dependent rows, no residual). */
++  redundant: string[]
++  /** Object ids that touch a conflicting constraint — for highlighting. */
++  conflictObjects: Set<string>
++  /** Structural-relation ids whose compiled constraints are in conflict. */
++  conflictRelations: Set<string>
++}
++
++/** Map constraint ids back to the relation that compiled them (relations.ts
++ *  mints constraint ids as `${relationId}~k`). */
++export function relationOfConstraint(cid: string): string | null {
++  const i = cid.indexOf('~')
++  return i > 0 ? cid.slice(0, i) : null
++}
++
++export function analyze(doc: SketchDoc, solved: SolveResult, pinned?: ReadonlySet<string>, positions?: ReadonlyMap<string, Pt>): SketchAnalysis {
++  const system = compile(doc, pinned)
++  const { n, hard, pointIds } = system
++  const v = new Float64Array(n)
++  doc.points.forEach((p, i) => {
++    const q = positions?.get(p.id) ?? solved.points.get(p.id) ?? p
++    v[2 * i] = q.x
++    v[2 * i + 1] = q.y
++  })
++  const J = jacobian(hard, v, n)
++  const freePoints = new Set<string>()
++  const definedPoints = new Set<string>()
++  let dof = n
++  if (hard.length > 0 && n > 0) {
++    const ns = nullSpace(J, n, 1e-8)
++    dof = ns.length
++    pointIds.forEach((pid, i) => {
++      const moves = ns.some((vec) => Math.abs(vec[2 * i]!) > 1e-7 || Math.abs(vec[2 * i + 1]!) > 1e-7)
++      if (moves) freePoints.add(pid)
++      else definedPoints.add(pid)
++    })
++  } else {
++    for (const pid of pointIds) freePoints.add(pid)
++  }
++
++  // Row dependence: rank-revealing on Jᵀ (columns = equations). A non-pivot
++  // column is an equation linearly dependent on the ones before it.
++  const redundantSet = new Set<string>()
++  if (hard.length > 0 && n > 0) {
++    const JT = transpose(J, n)
++    const { pivots } = rref(JT, hard.length, 1e-8)
++    const pivotSet = new Set(pivots)
++    hard.forEach((eq, i) => {
++      if (!pivotSet.has(i)) redundantSet.add(eq.cid)
++    })
++  }
++  const conflicts = solved.conflicts.filter((c) => !c.startsWith('pin:'))
++  const conflictSet = new Set(solved.conflicts)
++  const status = new Map<string, ConstraintStatus>()
++  const redundant: string[] = []
++  for (const c of doc.constraints) {
++    if (conflictSet.has(c.id)) status.set(c.id, 'conflict')
++    else if (redundantSet.has(c.id)) {
++      status.set(c.id, 'redundant')
++      redundant.push(c.id)
++    } else status.set(c.id, 'ok')
++  }
++
++  // Objects touching a conflicting constraint (through their points/lines).
++  const conflictGeom = new Set<string>()
++  for (const c of doc.constraints) {
++    if (!conflictSet.has(c.id)) continue
++    for (const ref of constraintRefs(c)) {
++      conflictGeom.add(ref)
++      const l = lineById(doc, ref)
++      if (l) {
++        conflictGeom.add(l.a)
++        conflictGeom.add(l.b)
++      }
++    }
++  }
++  for (const pid of solved.conflicts) {
++    if (pid.startsWith('pin:')) conflictGeom.add(pid.slice(4))
++  }
++  const conflictObjects = new Set<string>()
++  for (const o of doc.objects) {
++    const ids = [...objectPointIds(doc, o), ...objectLineIds(o)]
++    if (ids.some((id) => conflictGeom.has(id))) conflictObjects.add(o.id)
++  }
++  const conflictRelations = new Set<string>()
++  for (const cid of solved.conflicts) {
++    const rid = relationOfConstraint(cid)
++    if (rid && doc.relations.some((r) => r.id === rid)) conflictRelations.add(rid)
++  }
++
++  return { dof, freePoints, definedPoints, status, conflicts, redundant, conflictObjects, conflictRelations }
++}
+diff --git a/src/parametric/doc.ts b/src/parametric/doc.ts
+new file mode 100644
+index 0000000..8bd1306
+--- /dev/null
++++ b/src/parametric/doc.ts
+@@ -0,0 +1,619 @@
++// src/parametric/doc.ts
++// DOCUMENT OPERATIONS — the pure reducer the sketcher UI dispatches into
++// (wrapped by roofwizard/history.ts's generic `undoable` for undo/redo).
++// Every action ends in `settle`: relations are re-compiled, the solver runs,
++// and positions are committed ONLY when every constraint holds. When they
++// cannot (a contradiction), the doc keeps its LAST CONSISTENT geometry and
++// keeps the offending constraint/relation IN the document, flagged by
++// `evaluate` — never deleted, never silently altered (owner brief §4).
++import type {
++  Constraint,
++  Dimension,
++  LayerKey,
++  LayerState,
++  Level,
++  Pt,
++  SketchDoc,
++  SketchObject,
++  StructuralRelation,
++} from './model'
++import { constraintRefs, emptyDoc, layerOf, lineById, mintId, objectById, objectLineIds, objectPointIds, pointById, relationRefs } from './model'
++import { compileRelations, REL_SEP, type CompileIssue } from './relations'
++import { analyze, type SketchAnalysis } from './analysis'
++import { solve, type SolveResult } from './solver'
++import { dist, projectT } from './geom'
++
++// ---------------------------------------------------------------------------
++// EVALUATION (derived, memoized by the UI)
++// ---------------------------------------------------------------------------
++
++/** User constraints + relation-compiled constraints, as one list. */
++export function fullConstraints(doc: SketchDoc): { constraints: Constraint[]; issues: CompileIssue[] } {
++  const rel = compileRelations(doc)
++  return { constraints: [...doc.constraints, ...rel.constraints], issues: rel.issues }
++}
++
++/** Point ids pinned by locked objects / locked layers. */
++export function pinnedPoints(doc: SketchDoc): Set<string> {
++  const out = new Set<string>()
++  for (const o of doc.objects) {
++    const layer = doc.layers[layerOf(o)]
++    if (o.locked === true || layer.locked) for (const p of objectPointIds(doc, o)) out.add(p)
++  }
++  return out
++}
++
++export interface Evaluation {
++  solved: SolveResult
++  analysis: SketchAnalysis
++  issues: CompileIssue[]
++}
++
++function solvableDoc(doc: SketchDoc): { doc: SketchDoc; issues: CompileIssue[] } {
++  const { constraints, issues } = fullConstraints(doc)
++  return { doc: { ...doc, constraints }, issues }
++}
++
++export function evaluate(doc: SketchDoc, drag?: ReadonlyMap<string, Pt>): Evaluation {
++  const s = solvableDoc(doc)
++  const pinned = pinnedPoints(doc)
++  const solved = solve({ doc: s.doc, pinned, drag })
++  const analysis = analyze(s.doc, solved, pinned)
++  return { solved, analysis, issues: s.issues }
++}
++
++/** Solve and commit positions when consistent; otherwise keep the previous
++ *  geometry (constraints stay). */
++export function settle(doc: SketchDoc, drag?: ReadonlyMap<string, Pt>): { doc: SketchDoc; ok: boolean; conflicts: string[] } {
++  const s = solvableDoc(doc)
++  const pinned = pinnedPoints(doc)
++  const solved = solve({ doc: s.doc, pinned, drag })
++  if (!solved.ok) return { doc, ok: false, conflicts: solved.conflicts }
++  let changed = false
++  const points = doc.points.map((p) => {
++    const q = solved.points.get(p.id)
++    if (!q) return p
++    if (Math.abs(q.x - p.x) < 1e-12 && Math.abs(q.y - p.y) < 1e-12) return p
++    changed = true
++    return { ...p, x: q.x, y: q.y }
++  })
++  return { doc: changed ? { ...doc, points } : doc, ok: true, conflicts: [] }
++}
++
++/** Object ids whose geometry differs between two docs (preview: "this change
++ *  also moves …"). */
++export function movedObjects(before: SketchDoc, after: SketchDoc, eps = 1e-6): string[] {
++  const moved = new Set<string>()
++  for (const p of after.points) {
++    const q = pointById(before, p.id)
++    if (!q || Math.abs(q.x - p.x) > eps || Math.abs(q.y - p.y) > eps) moved.add(p.id)
++  }
++  if (moved.size === 0) return []
++  return after.objects.filter((o) => objectPointIds(after, o).some((id) => moved.has(id))).map((o) => o.id)
++}
++
++// ---------------------------------------------------------------------------
++// ACTIONS
++// ---------------------------------------------------------------------------
++
++export type PointRef = { pointId: string } | Pt
++
++export type ObjectSpec =
++  | { kind: 'wall'; wallType: 'exterior' | 'interior'; thicknessM?: number; heightM?: number; lineIs?: 'center' | 'faceA' | 'faceB'; role?: SketchObject['role'] }
++  | { kind: 'beam'; sectionWmm?: number; sectionHmm?: number; material?: string; levelM?: number; role?: SketchObject['role'] }
++  | { kind: 'aux'; auxType: 'guide' | 'axis' | 'grid' }
++  | { kind: 'roofEdge'; edgeType: 'eave' | 'gable' | 'spanBoundary' }
++
++export type SketchAction =
++  | { kind: 'replaceDoc'; doc: SketchDoc }
++  | { kind: 'addPoint'; at: Pt }
++  | {
++      kind: 'addLine'
++      a: PointRef
++      b: PointRef
++      construction?: boolean
++      /** Inferred while drawing (near-horizontal/vertical) — SolidWorks-style. */
++      auto?: ('horizontal' | 'vertical')[]
++      /** Make the new line an object right away. */
++      as?: ObjectSpec
++      name?: string
++    }
++  | { kind: 'addColumn'; at: PointRef; sectionWmm?: number; sectionHmm?: number; heightM?: number; rotationDeg?: number; name?: string }
++  | { kind: 'addOpening'; wall: string; offsetM: number; widthM?: number; heightM?: number; sillM?: number; name?: string }
++  | { kind: 'addRoofOutline'; lines: string[]; name?: string }
++  | { kind: 'convertLine'; line: string; as: ObjectSpec; name?: string }
++  | { kind: 'movePoints'; targets: Record<string, Pt> }
++  | { kind: 'deleteLines'; ids: string[] }
++  | { kind: 'addConstraint'; c: DistributiveOmit<Constraint, 'id'> }
++  | { kind: 'removeConstraint'; id: string }
++  | { kind: 'setConstraintValue'; id: string; value: number }
++  | { kind: 'addDimension'; dim: Omit<Dimension, 'id' | 'constraintId'>; value?: number }
++  | { kind: 'setDimensionDriving'; id: string; driving: boolean; value?: number }
++  | { kind: 'setDimensionValue'; id: string; value: number }
++  | { kind: 'removeDimension'; id: string }
++  | { kind: 'updateObject'; id: string; patch: Partial<SketchObject> }
++  | { kind: 'removeObject'; id: string; keepGeometry?: boolean }
++  | { kind: 'addRelation'; relation: DistributiveOmit<StructuralRelation, 'id'> }
++  | { kind: 'updateRelation'; id: string; patch: Partial<StructuralRelation> }
++  | { kind: 'removeRelation'; id: string }
++  | { kind: 'setLayer'; key: LayerKey; patch: Partial<LayerState> }
++  | { kind: 'setLevels'; levels: Level[] }
++  | { kind: 'setRoofSlope'; slopePct: number | undefined }
++  | { kind: 'setRoofSupports'; supports: string[] }
++
++export type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never
++
++export const DEFAULTS = {
++  wallExtThicknessM: 0.25,
++  wallIntThicknessM: 0.15,
++  wallHeightM: 3,
++  columnSectionMm: 150,
++  columnHeightM: 3,
++  beamSectionWmm: 150,
++  beamSectionHmm: 200,
++  beamMaterial: 'GLULAM_2L',
++  beamLevelM: 3,
++  openingWidthM: 1,
++  openingHeightM: 2.1,
++  openingSillM: 0,
++} as const
++
++const AUTO_NAME_PREFIX: Record<SketchObject['kind'], string> = {
++  wall: 'ק',
++  column: 'ע',
++  beam: 'קורה ',
++  opening: 'פ',
++  roofOutline: 'מתאר גג',
++  roofEdge: 'קצה ',
++  aux: 'עזר ',
++}
++
++function autoName(doc: SketchDoc, kind: SketchObject['kind']): string {
++  const n = doc.objects.filter((o) => o.kind === kind).length + 1
++  if (kind === 'roofOutline') return n === 1 ? 'מתאר גג' : `מתאר גג ${n}`
++  return `${AUTO_NAME_PREFIX[kind]}${n}`
++}
++
++function resolvePoint(doc: SketchDoc, ref: PointRef): { doc: SketchDoc; id: string } {
++  if ('pointId' in ref) return { doc, id: ref.pointId }
++  const m = mintId(doc, 'p')
++  return { doc: { ...m.doc, points: [...m.doc.points, { id: m.id, x: ref.x, y: ref.y }] }, id: m.id }
++}
++
++type NewObject = DistributiveOmit<SketchObject, 'id' | 'name'> & { name?: string }
++
++function addObject(doc: SketchDoc, o: NewObject): { doc: SketchDoc; id: string } {
++  const m = mintId(doc, 'o')
++  const name = o.name ?? autoName(doc, o.kind)
++  const obj = { ...o, id: m.id, name } as SketchObject
++  return { doc: { ...m.doc, objects: [...m.doc.objects, obj] }, id: m.id }
++}
++
++function objectFromSpec(spec: ObjectSpec, lineId: string, name?: string): NewObject {
++  switch (spec.kind) {
++    case 'wall':
++      return {
++        kind: 'wall',
++        name,
++        wallType: spec.wallType,
++        line: lineId,
++        thicknessM: spec.thicknessM ?? (spec.wallType === 'exterior' ? DEFAULTS.wallExtThicknessM : DEFAULTS.wallIntThicknessM),
++        heightM: spec.heightM ?? DEFAULTS.wallHeightM,
++        lineIs: spec.lineIs ?? 'center',
++        role: spec.role ?? (spec.wallType === 'exterior' ? 'bearing' : 'non-bearing'),
++      }
++    case 'beam':
++      return {
++        kind: 'beam',
++        name,
++        line: lineId,
++        sectionWmm: spec.sectionWmm ?? DEFAULTS.beamSectionWmm,
++        sectionHmm: spec.sectionHmm ?? DEFAULTS.beamSectionHmm,
++        material: spec.material ?? DEFAULTS.beamMaterial,
++        levelM: spec.levelM ?? DEFAULTS.beamLevelM,
++        supports: [],
++        role: spec.role ?? 'bearing',
++      }
++    case 'aux':
++      return { kind: 'aux', name, line: lineId, auxType: spec.auxType, role: 'none' }
++    case 'roofEdge':
++      return { kind: 'roofEdge', name, line: lineId, edgeType: spec.edgeType, role: 'none' }
++  }
++}
++
++/** Remove points no line or column references any more. */
++function pruneOrphanPoints(doc: SketchDoc): SketchDoc {
++  const used = new Set<string>()
++  for (const l of doc.lines) {
++    used.add(l.a)
++    used.add(l.b)
++  }
++  for (const o of doc.objects) if (o.kind === 'column') used.add(o.point)
++  const points = doc.points.filter((p) => used.has(p.id))
++  if (points.length === doc.points.length) return doc
++  const gone = new Set(doc.points.filter((p) => !used.has(p.id)).map((p) => p.id))
++  return dropConstraintsReferencing({ ...doc, points }, gone)
++}
++
++function dropConstraintsReferencing(doc: SketchDoc, gone: ReadonlySet<string>): SketchDoc {
++  const constraints = doc.constraints.filter((c) => !constraintRefs(c).some((r) => gone.has(r)))
++  const goneC = new Set(doc.constraints.filter((c) => !constraints.includes(c)).map((c) => c.id))
++  const dimensions = doc.dimensions.filter((d) => !d.refs.some((r) => gone.has(r)) && !(d.constraintId && goneC.has(d.constraintId)))
++  return { ...doc, constraints, dimensions }
++}
++
++function removeLines(doc: SketchDoc, ids: ReadonlySet<string>): SketchDoc {
++  const lines = doc.lines.filter((l) => !ids.has(l.id))
++  // Objects owning a deleted line go too (and their relations).
++  const deadObjects = doc.objects.filter((o) => objectLineIds(o).some((l) => ids.has(l)))
++  let next: SketchDoc = { ...doc, lines }
++  for (const o of deadObjects) next = removeObjectInternal(next, o.id, true)
++  next = dropConstraintsReferencing(next, ids)
++  return pruneOrphanPoints(next)
++}
++
++function removeRelationInternal(doc: SketchDoc, id: string): SketchDoc {
++  const relations = doc.relations.filter((r) => r.id !== id)
++  if (relations.length === doc.relations.length) return doc
++  let next: SketchDoc = { ...doc, relations }
++  // A divide relation owns its guide line.
++  const guideId = `${id}${REL_SEP}line`
++  if (next.lines.some((l) => l.id === guideId)) {
++    next = { ...next, lines: next.lines.filter((l) => l.id !== guideId) }
++    next = dropConstraintsReferencing(next, new Set([guideId]))
++  }
++  // beamBetween recorded supports on the beam.
++  const r = doc.relations.find((x) => x.id === id)
++  if (r && r.kind === 'beamBetween') {
++    next = {
++      ...next,
++      objects: next.objects.map((o) =>
++        o.id === r.beam && o.kind === 'beam' ? { ...o, supports: o.supports.filter((s) => s !== r.supportA && s !== r.supportB) } : o,
++      ),
++    }
++  }
++  return next
++}
++
++function removeObjectInternal(doc: SketchDoc, id: string, geometryAlreadyGone: boolean): SketchDoc {
++  const o = objectById(doc, id)
++  if (!o) return doc
++  let next: SketchDoc = { ...doc, objects: doc.objects.filter((x) => x.id !== id) }
++  for (const r of doc.relations) if (relationRefs(r).includes(id)) next = removeRelationInternal(next, r.id)
++  // Openings on a removed wall go with it.
++  if (o.kind === 'wall') {
++    for (const op of doc.objects) if (op.kind === 'opening' && op.wall === id) next = removeObjectInternal(next, op.id, true)
++  }
++  // Beams that bore on this object lose it from their support list.
++  next = {
++    ...next,
++    objects: next.objects.map((b) => (b.kind === 'beam' && b.supports.includes(id) ? { ...b, supports: b.supports.filter((s) => s !== id) } : b)),
++  }
++  if (!geometryAlreadyGone && o.kind === 'column') next = pruneOrphanPoints(next)
++  return next
++}
++
++function newId(doc: SketchDoc, prefix: string): { id: string; doc: SketchDoc } {
++  return mintId(doc, prefix)
++}
++
++/** Pure reducer. Returns the SAME doc for a no-op. */
++export function sketchReducer(doc: SketchDoc, a: SketchAction): SketchDoc {
++  switch (a.kind) {
++    case 'replaceDoc':
++      return settle(a.doc).doc
++    case 'addPoint': {
++      const r = resolvePoint(doc, a.at)
++      return r.doc
++    }
++    case 'addLine': {
++      const ra = resolvePoint(doc, a.a)
++      const rb = resolvePoint(ra.doc, a.b)
++      if (ra.id === rb.id) return doc
++      const m = newId(rb.doc, 'l')
++      let next: SketchDoc = { ...m.doc, lines: [...m.doc.lines, { id: m.id, a: ra.id, b: rb.id, ...(a.construction ? { construction: true } : {}) }] }
++      for (const k of a.auto ?? []) {
++        const c = newId(next, 'c')
++        next = { ...c.doc, constraints: [...c.doc.constraints, { id: c.id, kind: k, line: m.id }] }
++      }
++      if (a.as) next = addObject(next, objectFromSpec(a.as, m.id, a.name)).doc
++      return settle(next).doc
++    }
++    case 'addColumn': {
++      const rp = resolvePoint(doc, a.at)
++      const next = addObject(rp.doc, {
++        kind: 'column',
++        name: a.name,
++        point: rp.id,
++        sectionWmm: a.sectionWmm ?? DEFAULTS.columnSectionMm,
++        sectionHmm: a.sectionHmm ?? DEFAULTS.columnSectionMm,
++        rotationDeg: a.rotationDeg ?? 0,
++        heightM: a.heightM ?? DEFAULTS.columnHeightM,
++        role: 'bearing',
++      })
++      return settle(next.doc).doc
++    }
++    case 'addOpening': {
++      const w = objectById(doc, a.wall)
++      if (!w || w.kind !== 'wall') return doc
++      const next = addObject(doc, {
++        kind: 'opening',
++        name: a.name,
++        wall: a.wall,
++        offsetM: a.offsetM,
++        widthM: a.widthM ?? DEFAULTS.openingWidthM,
++        heightM: a.heightM ?? DEFAULTS.openingHeightM,
++        sillM: a.sillM ?? DEFAULTS.openingSillM,
++        role: 'none',
++      })
++      return next.doc
++    }
++    case 'addRoofOutline': {
++      if (a.lines.length < 3 || a.lines.some((l) => !lineById(doc, l))) return doc
++      const next = addObject(doc, { kind: 'roofOutline', name: a.name, lines: [...a.lines], role: 'none' })
++      return next.doc
++    }
++    case 'convertLine': {
++      if (!lineById(doc, a.line)) return doc
++      const next = addObject(doc, objectFromSpec(a.as, a.line, a.name))
++      return settle(next.doc).doc
++    }
++    case 'movePoints': {
++      const drag = new Map<string, Pt>()
++      for (const [id, p] of Object.entries(a.targets)) if (pointById(doc, id)) drag.set(id, p)
++      if (drag.size === 0) return doc
++      const pinned = pinnedPoints(doc)
++      for (const id of drag.keys()) if (pinned.has(id)) drag.delete(id)
++      if (drag.size === 0) return doc
++      // No constraints at all: a drag is a plain move.
++      const { constraints } = fullConstraints(doc)
++      if (constraints.length === 0) {
++        return { ...doc, points: doc.points.map((p) => (drag.has(p.id) ? { ...p, ...drag.get(p.id)! } : p)) }
++      }
++      return settle(doc, drag).doc
++    }
++    case 'deleteLines': {
++      const ids = new Set(a.ids.filter((id) => lineById(doc, id)))
++      if (ids.size === 0) return doc
++      return settle(removeLines(doc, ids)).doc
++    }
++    case 'addConstraint': {
++      for (const ref of constraintRefs(a.c as Constraint)) {
++        if (!pointById(doc, ref) && !lineById(doc, ref)) return doc
++      }
++      const m = newId(doc, 'c')
++      const c = { ...a.c, id: m.id } as Constraint
++      return settle({ ...m.doc, constraints: [...m.doc.constraints, c] }).doc
++    }
++    case 'removeConstraint': {
++      const constraints = doc.constraints.filter((c) => c.id !== a.id)
++      if (constraints.length === doc.constraints.length) return doc
++      const dimensions = doc.dimensions.map((d) => (d.constraintId === a.id ? { ...d, driving: false, constraintId: undefined } : d))
++      return settle({ ...doc, constraints, dimensions }).doc
++    }
++    case 'setConstraintValue': {
++      if (!Number.isFinite(a.value)) return doc
++      const constraints = doc.constraints.map((c) => {
++        if (c.id !== a.id) return c
++        if (c.kind === 'angle') return { ...c, valueDeg: a.value }
++        if ('valueM' in c) return { ...c, valueM: a.value }
++        return c
++      })
++      return settle({ ...doc, constraints }).doc
++    }
++    case 'addDimension': {
++      const refsOk = a.dim.refs.every((r) => pointById(doc, r) || lineById(doc, r))
++      if (!refsOk) return doc
++      const m = newId(doc, 'd')
++      let next = m.doc
++      let constraintId: string | undefined
++      if (a.dim.driving) {
++        const value = a.value ?? measureDimension(doc, a.dim)
++        if (value === null) return doc
++        const c = constraintForDimension(next, a.dim, value)
++        if (!c) return doc
++        next = c.doc
++        constraintId = c.id
++      }
++      const dim: Dimension = { ...a.dim, id: m.id, ...(constraintId ? { constraintId } : {}) }
++      return settle({ ...next, dimensions: [...next.dimensions, dim] }).doc
++    }
++    case 'setDimensionDriving': {
++      const d = doc.dimensions.find((x) => x.id === a.id)
++      if (!d || d.driving === a.driving) return doc
++      if (!a.driving) {
++        return settle({
++          ...doc,
++          constraints: doc.constraints.filter((c) => c.id !== d.constraintId),
++          dimensions: doc.dimensions.map((x) => (x.id === a.id ? { ...x, driving: false, constraintId: undefined } : x)),
++        }).doc
++      }
++      const value = a.value ?? measureDimension(doc, d)
++      if (value === null) return doc
++      const c = constraintForDimension(doc, d, value)
++      if (!c) return doc
++      return settle({ ...c.doc, dimensions: c.doc.dimensions.map((x) => (x.id === a.id ? { ...x, driving: true, constraintId: c.id } : x)) }).doc
++    }
++    case 'setDimensionValue': {
++      const d = doc.dimensions.find((x) => x.id === a.id)
++      if (!d || !d.driving || !d.constraintId) return doc
++      return sketchReducer(doc, { kind: 'setConstraintValue', id: d.constraintId, value: a.value })
++    }
++    case 'removeDimension': {
++      const d = doc.dimensions.find((x) => x.id === a.id)
++      if (!d) return doc
++      return settle({
++        ...doc,
++        constraints: doc.constraints.filter((c) => c.id !== d.constraintId),
++        dimensions: doc.dimensions.filter((x) => x.id !== a.id),
++      }).doc
++    }
++    case 'updateObject': {
++      const o = objectById(doc, a.id)
++      if (!o) return doc
++      const patched = { ...o, ...a.patch } as SketchObject
++      return settle({ ...doc, objects: doc.objects.map((x) => (x.id === a.id ? patched : x)) }).doc
++    }
++    case 'removeObject': {
++      const o = objectById(doc, a.id)
++      if (!o) return doc
++      let next = removeObjectInternal(doc, a.id, false)
++      if (!a.keepGeometry) {
++        const lines = new Set(objectLineIds(o).filter((l) => !next.objects.some((x) => objectLineIds(x).includes(l))))
++        if (lines.size > 0) next = removeLines(next, lines)
++        else next = pruneOrphanPoints(next)
++      }
++      return settle(next).doc
++    }
++    case 'addRelation': {
++      for (const ref of relationRefs(a.relation as StructuralRelation)) {
++        if (!objectById(doc, ref) && !pointById(doc, ref)) return doc
++      }
++      const m = newId(doc, 'r')
++      let next = m.doc
++      let rel = { ...a.relation, id: m.id } as StructuralRelation
++      if (rel.kind === 'beamBetween') {
++        const beam = objectById(next, rel.beam)
++        if (!beam || beam.kind !== 'beam') return doc
++        const bl = lineById(next, beam.line)
++        if (!bl) return doc
++        // Orient supports to the nearer beam end so the relation is stable.
++        const pa = pointById(next, bl.a)!
++        const pb = pointById(next, bl.b)!
++        const sA = supportAnchor(next, rel.supportA)
++        const sB = supportAnchor(next, rel.supportB)
++        if (sA && sB && dist(pa, sA) + dist(pb, sB) > dist(pa, sB) + dist(pb, sA)) {
++          rel = { ...rel, supportA: rel.supportB, supportB: rel.supportA }
++        }
++        const supports = [...new Set([...beam.supports, rel.supportA, rel.supportB])]
++        next = { ...next, objects: next.objects.map((o) => (o.id === beam.id ? { ...beam, supports } : o)) }
++      }
++      if (rel.kind === 'divide') {
++        const pa = pointById(next, rel.boundA)
++        const pb = pointById(next, rel.boundB)
++        if (!pa || !pb || rel.columns.length === 0) return doc
++        const cols = rel.columns
++          .map((id) => objectById(next, id))
++          .filter((o): o is SketchObject & { kind: 'column' } => !!o && o.kind === 'column')
++        if (cols.length !== rel.columns.length) return doc
++        const ordered = [...cols].sort((x, y) => projectT(pointById(next, x.point)!, pa, pb) - projectT(pointById(next, y.point)!, pa, pb))
++        rel = { ...rel, columns: ordered.map((c) => c.id) }
++        next = { ...next, lines: [...next.lines, { id: `${rel.id}${REL_SEP}line`, a: rel.boundA, b: rel.boundB, construction: true }] }
++      }
++      return settle({ ...next, relations: [...next.relations, rel] }).doc
++    }
++    case 'updateRelation': {
++      const r = doc.relations.find((x) => x.id === a.id)
++      if (!r) return doc
++      const patched = { ...r, ...a.patch } as StructuralRelation
++      return settle({ ...doc, relations: doc.relations.map((x) => (x.id === a.id ? patched : x)) }).doc
++    }
++    case 'removeRelation':
++      return settle(removeRelationInternal(doc, a.id)).doc
++    case 'setLayer': {
++      const cur = doc.layers[a.key]
++      const next = { ...cur, ...a.patch }
++      if (next.visible === cur.visible && next.locked === cur.locked) return doc
++      return { ...doc, layers: { ...doc.layers, [a.key]: next } }
++    }
++    case 'setLevels':
++      return { ...doc, levels: a.levels }
++    case 'setRoofSlope':
++      return { ...doc, roofSlopePct: a.slopePct }
++    case 'setRoofSupports':
++      return { ...doc, roofSupports: a.supports }
++  }
++}
++
++function supportAnchor(doc: SketchDoc, id: string): Pt | null {
++  const o = objectById(doc, id)
++  if (!o) return null
++  if (o.kind === 'column') return pointById(doc, o.point) ?? null
++  const lineId = o.kind === 'wall' || o.kind === 'beam' || o.kind === 'aux' || o.kind === 'roofEdge' ? o.line : null
++  if (!lineId) return null
++  const l = lineById(doc, lineId)
++  if (!l) return null
++  const pa = pointById(doc, l.a)
++  const pb = pointById(doc, l.b)
++  return pa && pb ? { x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2 } : null
++}
++
++/** Current measured value of a dimension (meters or degrees); null when its
++ *  geometry is missing. Used for reference dimensions AND to seed a driving
++ *  one with the as-drawn value. */
++export function measureDimension(doc: SketchDoc, d: Pick<Dimension, 'kind' | 'refs'>, positions?: ReadonlyMap<string, Pt>): number | null {
++  const P = (id: string): Pt | null => positions?.get(id) ?? pointById(doc, id) ?? null
++  const L = (id: string): { a: Pt; b: Pt } | null => {
++    const l = lineById(doc, id)
++    if (!l) return null
++    const a = P(l.a)
++    const b = P(l.b)
++    return a && b ? { a, b } : null
++  }
++  switch (d.kind) {
++    case 'length': {
++      const l = L(d.refs[0] ?? '')
++      return l ? dist(l.a, l.b) : null
++    }
++    case 'pointDistance': {
++      const p = P(d.refs[0] ?? '')
++      const q = P(d.refs[1] ?? '')
++      return p && q ? dist(p, q) : null
++    }
++    case 'pointLineDistance': {
++      const p = P(d.refs[0] ?? '')
++      const l = L(d.refs[1] ?? '')
++      if (!p || !l) return null
++      const dx = l.b.x - l.a.x
++      const dy = l.b.y - l.a.y
++      const len = Math.hypot(dx, dy)
++      if (len < 1e-12) return null
++      return (dx * (p.y - l.a.y) - dy * (p.x - l.a.x)) / len
++    }
++    case 'lineDistance': {
++      const a = L(d.refs[0] ?? '')
++      const b = L(d.refs[1] ?? '')
++      if (!a || !b) return null
++      const dx = a.b.x - a.a.x
++      const dy = a.b.y - a.a.y
++      const len = Math.hypot(dx, dy)
++      if (len < 1e-12) return null
++      const m = { x: (b.a.x + b.b.x) / 2, y: (b.a.y + b.b.y) / 2 }
++      return (dx * (m.y - a.a.y) - dy * (m.x - a.a.x)) / len
++    }
++    case 'angle': {
++      const a = L(d.refs[0] ?? '')
++      const b = L(d.refs[1] ?? '')
++      if (!a || !b) return null
++      const u = { x: a.b.x - a.a.x, y: a.b.y - a.a.y }
++      const w = { x: b.b.x - b.a.x, y: b.b.y - b.a.y }
++      return (Math.atan2(u.x * w.y - u.y * w.x, u.x * w.x + u.y * w.y) * 180) / Math.PI
++    }
++  }
++}
++
++function constraintForDimension(doc: SketchDoc, d: Pick<Dimension, 'kind' | 'refs'>, value: number): { doc: SketchDoc; id: string } | null {
++  const m = newId(doc, 'c')
++  let c: Constraint | null = null
++  switch (d.kind) {
++    case 'length':
++      c = { id: m.id, kind: 'length', line: d.refs[0]!, valueM: value }
++      break
++    case 'pointDistance':
++      c = { id: m.id, kind: 'pointDistance', p: d.refs[0]!, q: d.refs[1]!, valueM: value }
++      break
++    case 'pointLineDistance':
++      c = { id: m.id, kind: 'pointLineDistance', p: d.refs[0]!, line: d.refs[1]!, valueM: value }
++      break
++    case 'lineDistance':
++      c = { id: m.id, kind: 'lineDistance', a: d.refs[0]!, b: d.refs[1]!, valueM: value }
++      break
++    case 'angle':
++      c = { id: m.id, kind: 'angle', a: d.refs[0]!, b: d.refs[1]!, valueDeg: value }
++      break
++  }
++  if (!c) return null
++  return { doc: { ...m.doc, constraints: [...m.doc.constraints, c] }, id: m.id }
++}
++
++export { emptyDoc }
+diff --git a/src/parametric/geom.ts b/src/parametric/geom.ts
+new file mode 100644
+index 0000000..38e2fe5
+--- /dev/null
++++ b/src/parametric/geom.ts
+@@ -0,0 +1,81 @@
++// src/parametric/geom.ts
++// Small pure 2D vector helpers shared by the solver, relations and the UI.
++import type { Pt } from './model'
++
++export const sub = (p: Pt, q: Pt): Pt => ({ x: p.x - q.x, y: p.y - q.y })
++export const add = (p: Pt, q: Pt): Pt => ({ x: p.x + q.x, y: p.y + q.y })
++export const scale = (p: Pt, k: number): Pt => ({ x: p.x * k, y: p.y * k })
++export const dot = (p: Pt, q: Pt): number => p.x * q.x + p.y * q.y
++export const cross = (p: Pt, q: Pt): number => p.x * q.y - p.y * q.x
++export const len = (p: Pt): number => Math.hypot(p.x, p.y)
++export const dist = (p: Pt, q: Pt): number => Math.hypot(p.x - q.x, p.y - q.y)
++export const mid = (p: Pt, q: Pt): Pt => ({ x: (p.x + q.x) / 2, y: (p.y + q.y) / 2 })
++/** Left-hand normal of a→b (CCW 90°), unit length; {0,0} for a zero vector. */
++export function leftNormal(a: Pt, b: Pt): Pt {
++  const d = sub(b, a)
++  const l = len(d)
++  if (l < 1e-12) return { x: 0, y: 0 }
++  return { x: -d.y / l, y: d.x / l }
++}
++export function unit(d: Pt): Pt {
++  const l = len(d)
++  return l < 1e-12 ? { x: 0, y: 0 } : { x: d.x / l, y: d.y / l }
++}
++/** Signed distance of p from the infinite line a→b (positive = left side). */
++export function signedDist(p: Pt, a: Pt, b: Pt): number {
++  const d = sub(b, a)
++  const l = len(d)
++  if (l < 1e-12) return dist(p, a)
++  return cross(d, sub(p, a)) / l
++}
++/** Parameter t of the projection of p onto a→b (0 at a, 1 at b). */
++export function projectT(p: Pt, a: Pt, b: Pt): number {
++  const d = sub(b, a)
++  const l2 = dot(d, d)
++  if (l2 < 1e-18) return 0
++  return dot(sub(p, a), d) / l2
++}
++export const lerp = (a: Pt, b: Pt, t: number): Pt => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
++/** Closest point on SEGMENT a→b. */
++export function closestOnSegment(p: Pt, a: Pt, b: Pt): Pt {
++  const t = Math.max(0, Math.min(1, projectT(p, a, b)))
++  return lerp(a, b, t)
++}
++/** Intersection of infinite lines (a1→a2) and (b1→b2); null when parallel. */
++export function lineIntersection(a1: Pt, a2: Pt, b1: Pt, b2: Pt): Pt | null {
++  const r = sub(a2, a1)
++  const s = sub(b2, b1)
++  const den = cross(r, s)
++  if (Math.abs(den) < 1e-12) return null
++  const t = cross(sub(b1, a1), s) / den
++  return add(a1, scale(r, t))
++}
++export const angleDeg = (d: Pt): number => (Math.atan2(d.y, d.x) * 180) / Math.PI
++export const degToRad = (deg: number): number => (deg * Math.PI) / 180
++/** Wrap an angle (degrees) into (-180, 180]. */
++export function wrapDeg(a: number): number {
++  let r = ((a + 180) % 360 + 360) % 360 - 180
++  if (r === -180) r = 180
++  return r
++}
++/** Shoelace signed area of a ring (CCW positive). */
++export function signedArea(ring: readonly Pt[]): number {
++  let s = 0
++  for (let i = 0; i < ring.length; i++) {
++    const p = ring[i]!
++    const q = ring[(i + 1) % ring.length]!
++    s += p.x * q.y - q.x * p.y
++  }
++  return s / 2
++}
++export function bounds(pts: readonly Pt[]): { minX: number; minY: number; maxX: number; maxY: number } | null {
++  if (pts.length === 0) return null
++  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
++  for (const p of pts) {
++    if (p.x < minX) minX = p.x
++    if (p.y < minY) minY = p.y
++    if (p.x > maxX) maxX = p.x
++    if (p.y > maxY) maxY = p.y
++  }
++  return { minX, minY, maxX, maxY }
++}
+diff --git a/src/parametric/linalg.ts b/src/parametric/linalg.ts
+new file mode 100644
+index 0000000..6418ecb
+--- /dev/null
++++ b/src/parametric/linalg.ts
+@@ -0,0 +1,107 @@
++// src/parametric/linalg.ts
++// Dense linear algebra for the constraint solver — sizes are tiny (a sketch
++// has tens of points), so plain arrays of Float64Array are the right tool.
++// No dependency: nothing in the catalog does this and the solver must stay
++// framework-free (same doctrine as roofwizard/freeWalls.ts).
++
++export type Mat = Float64Array[]
++
++export const zeros = (rows: number, cols: number): Mat =>
++  Array.from({ length: rows }, () => new Float64Array(cols))
++
++/** Solve A x = b for symmetric positive-definite A (Cholesky). Returns null
++ *  when A is not SPD within tolerance (caller raises damping). */
++export function solveSPD(A: Mat, b: Float64Array): Float64Array | null {
++  const n = b.length
++  const L = zeros(n, n)
++  for (let i = 0; i < n; i++) {
++    for (let j = 0; j <= i; j++) {
++      let s = A[i]![j]!
++      for (let k = 0; k < j; k++) s -= L[i]![k]! * L[j]![k]!
++      if (i === j) {
++        if (s <= 1e-300) return null
++        L[i]![j] = Math.sqrt(s)
++      } else {
++        L[i]![j] = s / L[j]![j]!
++      }
++    }
++  }
++  const y = new Float64Array(n)
++  for (let i = 0; i < n; i++) {
++    let s = b[i]!
++    for (let k = 0; k < i; k++) s -= L[i]![k]! * y[k]!
++    y[i] = s / L[i]![i]!
++  }
++  const x = new Float64Array(n)
++  for (let i = n - 1; i >= 0; i--) {
++    let s = y[i]!
++    for (let k = i + 1; k < n; k++) s -= L[k]![i]! * x[k]!
++    x[i] = s / L[i]![i]!
++  }
++  return x
++}
++
++export interface Rref {
++  /** Reduced matrix (copy). */
++  R: Mat
++  /** Pivot column for each pivot row, in order. */
++  pivots: number[]
++  rank: number
++}
++
++/** Reduced row-echelon form with partial pivoting and a RELATIVE tolerance
++ *  (entries below tol × the matrix's largest absolute entry are zero). */
++export function rref(M: Mat, cols: number, tol = 1e-9): Rref {
++  const R = M.map((r) => Float64Array.from(r))
++  const rows = R.length
++  let maxAbs = 0
++  for (const r of R) for (let j = 0; j < cols; j++) maxAbs = Math.max(maxAbs, Math.abs(r[j]!))
++  const eps = tol * (maxAbs > 0 ? maxAbs : 1)
++  const pivots: number[] = []
++  let row = 0
++  for (let col = 0; col < cols && row < rows; col++) {
++    let best = row
++    for (let i = row + 1; i < rows; i++) if (Math.abs(R[i]![col]!) > Math.abs(R[best]![col]!)) best = i
++    if (Math.abs(R[best]![col]!) <= eps) continue
++    if (best !== row) {
++      const t = R[best]!
++      R[best] = R[row]!
++      R[row] = t
++    }
++    const pr = R[row]!
++    const pv = pr[col]!
++    for (let j = 0; j < cols; j++) pr[j] = pr[j]! / pv
++    for (let i = 0; i < rows; i++) {
++      if (i === row) continue
++      const f = R[i]![col]!
++      if (f === 0) continue
++      const ri = R[i]!
++      for (let j = 0; j < cols; j++) ri[j] = ri[j]! - f * pr[j]!
++    }
++    pivots.push(col)
++    row++
++  }
++  return { R, pivots, rank: pivots.length }
++}
++
++/** Null-space basis of M (cols variables): one vector per free column. */
++export function nullSpace(M: Mat, cols: number, tol = 1e-9): Float64Array[] {
++  const { R, pivots } = rref(M, cols, tol)
++  const pivotSet = new Set(pivots)
++  const free: number[] = []
++  for (let j = 0; j < cols; j++) if (!pivotSet.has(j)) free.push(j)
++  return free.map((fc) => {
++    const v = new Float64Array(cols)
++    v[fc] = 1
++    pivots.forEach((pc, i) => {
++      v[pc] = -R[i]![fc]!
++    })
++    return v
++  })
++}
++
++export function transpose(M: Mat, cols: number): Mat {
++  const T = zeros(cols, M.length)
++  for (let i = 0; i < M.length; i++) for (let j = 0; j < cols; j++) T[j]![i] = M[i]![j]!
++  return T
++}
+diff --git a/src/parametric/model.ts b/src/parametric/model.ts
+new file mode 100644
+index 0000000..93b8b00
+--- /dev/null
++++ b/src/parametric/model.ts
+@@ -0,0 +1,475 @@
++// src/parametric/model.ts
++// PARAMETRIC SKETCHER — domain model (owner brief 2026-10-07: "סביבת שרטוט
++// פרמטרית, שבה ניתן להגדיר גאומטריה, יחסים בין אובייקטים ותפקידים מבניים").
++// PURE DATA. No React, no DOM, no engine imports. Everything here is
++// persisted verbatim (see persist.ts) — meters throughout, plan space
++// (x along the building length, y along its width), same frame as
++// roofwizard/types.ts's RoofModel.contour so the roof bridge
++// (roofBridge.ts) never has to convert units or axes.
++//
++// Three layers, each referencing the one below by id only:
++//   1. GEOMETRY   — points and lines (the only things the solver moves).
++//   2. CONSTRAINTS — relations between geometry (what the solver enforces),
++//                   including DRIVING dimensions. A REFERENCE dimension is
++//                   NOT a constraint — it only reads geometry (see Dimension).
++//   3. OBJECTS    — semantic things (wall/column/beam/opening/roof/aux) that
++//                   OWN geometry and carry non-geometric properties
++//                   (thickness, height, section, material, level, role).
++//   4. STRUCTURAL RELATIONS — owner-level intents ("column at wall corner",
++//                   "beam between two columns", "divide between bounds") that
++//                   COMPILE into constraints (relations.ts). Stored so they can
++//                   be listed, edited and deleted as ONE thing.
++
++export interface Pt { x: number; y: number }
++
++export interface SketchPoint {
++  id: string
++  x: number
++  y: number
++}
++
++export interface SketchLine {
++  id: string
++  /** Endpoint ids (SketchPoint). */
++  a: string
++  b: string
++  /** Construction geometry (aux/axis/grid) — never part of the structure. */
++  construction?: boolean
++}
++
++// ---------------------------------------------------------------------------
++// CONSTRAINTS
++// ---------------------------------------------------------------------------
++
++/** Which line of a wall a distance is measured from. 'center' = the wall's own
++ *  sketch line; 'faceA'/'faceB' = the two faces, offset by ±thickness/2 along
++ *  the line's left normal (faceA = left side of a→b, faceB = right side).
++ *  Resolved at compile time from the OWNING object's thickness — never a
++ *  copied number, so a thickness edit re-solves correctly. */
++export type WallFaceRef = 'center' | 'faceA' | 'faceB'
++
++export type Constraint =
++  // --- single-line orientation
++  | { id: string; kind: 'horizontal'; line: string }
++  | { id: string; kind: 'vertical'; line: string }
++  // --- two lines
++  | { id: string; kind: 'parallel'; a: string; b: string }
++  | { id: string; kind: 'perpendicular'; a: string; b: string }
++  | { id: string; kind: 'collinear'; a: string; b: string }
++  | { id: string; kind: 'equalLength'; a: string; b: string }
++  /** angle(a,b) == angle(c,d). */
++  | { id: string; kind: 'equalAngle'; a: string; b: string; c: string; d: string }
++  // --- points
++  | { id: string; kind: 'coincident'; p: string; q: string }
++  | { id: string; kind: 'pointOnLine'; p: string; line: string }
++  | { id: string; kind: 'midpoint'; p: string; line: string }
++  /** p and q mirror each other across `axis`. */
++  | { id: string; kind: 'symmetric'; p: string; q: string; axis: string }
++  /** p is equidistant from lines a and b (מרכוז בין שני קווים). */
++  | { id: string; kind: 'centered'; p: string; a: string; b: string }
++  /** Pin a point where it is (קיבוע). */
++  | { id: string; kind: 'fixed'; p: string; x: number; y: number }
++  // --- driving dimensions
++  | { id: string; kind: 'length'; line: string; valueM: number }
++  | { id: string; kind: 'pointDistance'; p: string; q: string; valueM: number }
++  /** SIGNED distance of p from the line's (optionally offset) axis — sign
++   *  keeps the point on its side. `face`+`offsetM` are resolved by
++   *  relations.ts (offsetM = ±thickness/2 for a wall face). */
++  | { id: string; kind: 'pointLineDistance'; p: string; line: string; valueM: number; offsetM?: number }
++  /** Line b parallel to line a at a signed distance (both endpoints of b). */
++  | { id: string; kind: 'lineDistance'; a: string; b: string; valueM: number; offsetM?: number }
++  /** Angle from line a to line b, degrees CCW. */
++  | { id: string; kind: 'angle'; a: string; b: string; valueDeg: number }
++  /** |p-q| == |r-s| (equal spacing in a division). */
++  | { id: string; kind: 'equalDistance'; p: string; q: string; r: string; s: string }
++
++export type ConstraintKind = Constraint['kind']
++
++/** A displayed dimension. `driving` = also a constraint (constraintId); a
++ *  REFERENCE dimension (driving === false) only measures — owner brief §4:
++ *  "להבחין בין מידה שמניעה את הגאומטריה לבין מידה שמציגה מדידה בלבד". */
++export interface Dimension {
++  id: string
++  kind: 'length' | 'pointDistance' | 'pointLineDistance' | 'lineDistance' | 'angle'
++  refs: string[]
++  driving: boolean
++  /** The constraint this dimension drives (driving only). */
++  constraintId?: string
++  /** Where the label sits, as an offset from the measured geometry (meters). */
++  labelOffsetM?: Pt
++}
++
++// ---------------------------------------------------------------------------
++// OBJECTS
++// ---------------------------------------------------------------------------
++
++/** The structural role is a SEPARATE attribute from the object type (owner
++ *  brief §2: "סוג האובייקט והתפקיד המבני שלו הם מאפיינים נפרדים"). Marking
++ *  something 'bearing' records the user's INTENT; it is not an engineering
++ *  approval of its capacity (brief §6). */
++export type StructuralRole = 'bearing' | 'non-bearing' | 'none'
++
++interface ObjectBase {
++  id: string
++  /** Free name or code shown in the plan + panel ("ק1", "ע3", "קורה A"). */
++  name: string
++  role: StructuralRole
++  /** Hidden objects still exist and still constrain; locked ones cannot be
++   *  dragged (their points are pinned by the solver via an implicit fix). */
++  hidden?: boolean
++  locked?: boolean
++}
++
++export interface WallObject extends ObjectBase {
++  kind: 'wall'
++  wallType: 'exterior' | 'interior'
++  /** The wall's sketch line (axis the solver moves). */
++  line: string
++  thicknessM: number
++  heightM: number
++  /** Which wall line the sketch line represents: the wall's center or one of
++   *  its faces. For an exterior wall drawn along its outer face: 'faceOut'
++   *  means the sketch line IS the outer face and the body lies to the inside. */
++  lineIs: 'center' | 'faceA' | 'faceB'
++}
++
++export interface ColumnObject extends ObjectBase {
++  kind: 'column'
++  /** Center point. */
++  point: string
++  sectionWmm: number
++  sectionHmm: number
++  rotationDeg: number
++  heightM: number
++}
++
++export interface BeamObject extends ObjectBase {
++  kind: 'beam'
++  line: string
++  sectionWmm: number
++  sectionHmm: number
++  material: string
++  /** Underside level above floor, meters. */
++  levelM: number
++  /** Object ids this beam bears on (columns / walls / other beams) —
++   *  recorded by relations.ts's beamBetween and shown in the panel. */
++  supports: string[]
++}
++
++export interface OpeningObject extends ObjectBase {
++  kind: 'opening'
++  wall: string
++  /** Center of the opening along the wall, meters from the wall line's `a`. */
++  offsetM: number
++  widthM: number
++  heightM: number
++  sillM: number
++}
++
++/** A closed roof outline — the loop the roof engine receives (eave/gable
++ *  attributes live on the RoofModel side). */
++export interface RoofOutlineObject extends ObjectBase {
++  kind: 'roofOutline'
++  /** Ordered loop of line ids (each shares an endpoint with the next). */
++  lines: string[]
++}
++
++/** One roof-edge / span-boundary marker on a line. */
++export interface RoofEdgeObject extends ObjectBase {
++  kind: 'roofEdge'
++  line: string
++  edgeType: 'eave' | 'gable' | 'spanBoundary'
++}
++
++export interface AuxObject extends ObjectBase {
++  kind: 'aux'
++  line: string
++  auxType: 'guide' | 'axis' | 'grid'
++}
++
++export type SketchObject =
++  | WallObject
++  | ColumnObject
++  | BeamObject
++  | OpeningObject
++  | RoofOutlineObject
++  | RoofEdgeObject
++  | AuxObject
++
++export type ObjectKind = SketchObject['kind']
++
++// ---------------------------------------------------------------------------
++// STRUCTURAL RELATIONS (owner brief §3) — compiled into constraints
++// ---------------------------------------------------------------------------
++
++export type StructuralRelation =
++  /** Column center on an axis / aux line (or any line). */
++  | { id: string; kind: 'columnOnAxis'; column: string; line: string }
++  /** Column at the corner of two walls, measured to each wall's center/face. */
++  | {
++      id: string
++      kind: 'columnAtCorner'
++      column: string
++      wallA: string
++      wallB: string
++      refA: WallFaceRef
++      refB: WallFaceRef
++      /** Clearance from each wall ref to the column CENTER (meters, signed —
++       *  positive = toward the wall's faceA side). */
++      distA: number
++      distB: number
++    }
++  /** Column (or beam line) at a signed distance from a wall center/face. */
++  | { id: string; kind: 'offsetFromWall'; target: string; wall: string; ref: WallFaceRef; distM: number }
++  /** Beam ends rest on two supports (column point / wall line / beam line). */
++  | { id: string; kind: 'beamBetween'; beam: string; supportA: string; supportB: string }
++  /** Align a line object (wall/beam/roofEdge/aux) to a wall or beam's
++   *  center / faceA / faceB with an extra gap. */
++  | { id: string; kind: 'alignTo'; target: string; reference: string; ref: WallFaceRef; gapM: number }
++  /** N columns spread evenly between two bound points (local division). */
++  | {
++      id: string
++      kind: 'divide'
++      columns: string[]
++      boundA: string
++      boundB: string
++      /** 'count' = evenly spaced (the column list length); 'spacing' = a
++       *  fixed pitch from boundA (the last gap absorbs the remainder). */
++      by: 'count' | 'spacing'
++      spacingM?: number
++    }
++  /** Roof edge line parallel to an exterior wall's outer face at the overhang. */
++  | { id: string; kind: 'roofOverhang'; roofEdge: string; wall: string; overhangM: number }
++
++export type RelationKind = StructuralRelation['kind']
++
++// ---------------------------------------------------------------------------
++// LEVELS / SLOPES (non-geometric: brief §3 "מפלסים, הפרשי גובה ושיפועים")
++// ---------------------------------------------------------------------------
++
++export interface Level {
++  id: string
++  name: string
++  elevationM: number
++}
++
++// ---------------------------------------------------------------------------
++// LAYERS (visibility + lock per object family — brief §5)
++// ---------------------------------------------------------------------------
++
++export type LayerKey = 'wallExt' | 'wallInt' | 'column' | 'beam' | 'opening' | 'roof' | 'aux' | 'dims' | 'constraints'
++
++export interface LayerState { visible: boolean; locked: boolean }
++
++export const LAYER_KEYS: LayerKey[] = ['wallExt', 'wallInt', 'column', 'beam', 'opening', 'roof', 'aux', 'dims', 'constraints']
++
++export const defaultLayers = (): Record<LayerKey, LayerState> => ({
++  wallExt: { visible: true, locked: false },
++  wallInt: { visible: true, locked: false },
++  column: { visible: true, locked: false },
++  beam: { visible: true, locked: false },
++  opening: { visible: true, locked: false },
++  roof: { visible: true, locked: false },
++  aux: { visible: true, locked: false },
++  dims: { visible: true, locked: false },
++  constraints: { visible: true, locked: false },
++})
++
++// ---------------------------------------------------------------------------
++// DOCUMENT
++// ---------------------------------------------------------------------------
++
++export const SKETCH_DOC_VERSION = 1
++
++export interface SketchDoc {
++  v: number
++  points: SketchPoint[]
++  lines: SketchLine[]
++  constraints: Constraint[]
++  dimensions: Dimension[]
++  objects: SketchObject[]
++  relations: StructuralRelation[]
++  levels: Level[]
++  layers: Record<LayerKey, LayerState>
++  /** Monotonic id counter — ids are minted from the doc, never from a module
++   *  counter, so save/load can never collide. */
++  seq: number
++  /** The roof's declared supports (object ids the roof rests on) — written
++   *  by the roof bridge when the roof is (re)built from this sketch. */
++  roofSupports?: string[]
++  /** Slope percent handed to the roof (brief §3 "שיפועים"); the roof model
++   *  stays the owner of slopePct — this is only the sketch's request. */
++  roofSlopePct?: number
++}
++
++export function emptyDoc(): SketchDoc {
++  return {
++    v: SKETCH_DOC_VERSION,
++    points: [],
++    lines: [],
++    constraints: [],
++    dimensions: [],
++    objects: [],
++    relations: [],
++    levels: [{ id: 'lv0', name: 'רצפה 0.00', elevationM: 0 }],
++    layers: defaultLayers(),
++    seq: 1,
++  }
++}
++
++export function mintId(doc: SketchDoc, prefix: string): { id: string; doc: SketchDoc } {
++  const id = `${prefix}${doc.seq}`
++  return { id, doc: { ...doc, seq: doc.seq + 1 } }
++}
++
++export const pointById = (doc: SketchDoc, id: string): SketchPoint | undefined => doc.points.find((p) => p.id === id)
++export const lineById = (doc: SketchDoc, id: string): SketchLine | undefined => doc.lines.find((l) => l.id === id)
++export const objectById = (doc: SketchDoc, id: string): SketchObject | undefined => doc.objects.find((o) => o.id === id)
++export const constraintById = (doc: SketchDoc, id: string): Constraint | undefined =>
++  doc.constraints.find((c) => c.id === id)
++
++/** The layer an object family lives on. */
++export function layerOf(o: SketchObject): LayerKey {
++  switch (o.kind) {
++    case 'wall': return o.wallType === 'exterior' ? 'wallExt' : 'wallInt'
++    case 'column': return 'column'
++    case 'beam': return 'beam'
++    case 'opening': return 'opening'
++    case 'roofOutline':
++    case 'roofEdge': return 'roof'
++    case 'aux': return 'aux'
++  }
++}
++
++/** Point ids an object owns (directly or through its line). */
++export function objectPointIds(doc: SketchDoc, o: SketchObject): string[] {
++  const ofLine = (lineId: string): string[] => {
++    const l = lineById(doc, lineId)
++    return l ? [l.a, l.b] : []
++  }
++  switch (o.kind) {
++    case 'wall':
++    case 'beam':
++    case 'roofEdge':
++    case 'aux':
++      return ofLine(o.line)
++    case 'column':
++      return [o.point]
++    case 'opening':
++      return []
++    case 'roofOutline':
++      return [...new Set(o.lines.flatMap(ofLine))]
++  }
++}
++
++/** Line ids an object owns. */
++export function objectLineIds(o: SketchObject): string[] {
++  switch (o.kind) {
++    case 'wall':
++    case 'beam':
++    case 'roofEdge':
++    case 'aux':
++      return [o.line]
++    case 'roofOutline':
++      return o.lines
++    case 'column':
++    case 'opening':
++      return []
++  }
++}
++
++/** Geometry ids (points + lines) a constraint references. */
++export function constraintRefs(c: Constraint): string[] {
++  switch (c.kind) {
++    case 'horizontal':
++    case 'vertical':
++    case 'length':
++      return [c.line]
++    case 'parallel':
++    case 'perpendicular':
++    case 'collinear':
++    case 'equalLength':
++    case 'angle':
++    case 'lineDistance':
++      return [c.a, c.b]
++    case 'equalAngle':
++      return [c.a, c.b, c.c, c.d]
++    case 'coincident':
++    case 'pointDistance':
++      return [c.p, c.q]
++    case 'pointOnLine':
++    case 'midpoint':
++    case 'pointLineDistance':
++      return [c.p, c.line]
++    case 'symmetric':
++      return [c.p, c.q, c.axis]
++    case 'centered':
++      return [c.p, c.a, c.b]
++    case 'fixed':
++      return [c.p]
++    case 'equalDistance':
++      return [c.p, c.q, c.r, c.s]
++  }
++}
++
++/** Object ids a structural relation references. */
++export function relationRefs(r: StructuralRelation): string[] {
++  switch (r.kind) {
++    case 'columnOnAxis': return [r.column, r.line]
++    case 'columnAtCorner': return [r.column, r.wallA, r.wallB]
++    case 'offsetFromWall': return [r.target, r.wall]
++    case 'beamBetween': return [r.beam, r.supportA, r.supportB]
++    case 'alignTo': return [r.target, r.reference]
++    case 'divide': return [...r.columns, r.boundA, r.boundB]
++    case 'roofOverhang': return [r.roofEdge, r.wall]
++  }
++}
++
++/** Hebrew labels (UI + warnings). */
++export const CONSTRAINT_LABEL_HE: Record<ConstraintKind, string> = {
++  horizontal: 'אופקי',
++  vertical: 'אנכי',
++  parallel: 'מקביל',
++  perpendicular: 'ניצב',
++  collinear: 'על אותו ציר',
++  equalLength: 'אורכים שווים',
++  equalAngle: 'זוויות שוות',
++  coincident: 'נקודות מחוברות',
++  pointOnLine: 'נקודה על קו',
++  midpoint: 'נקודת אמצע',
++  symmetric: 'סימטריה סביב ציר',
++  centered: 'מרכוז',
++  fixed: 'קיבוע',
++  length: 'אורך',
++  pointDistance: 'מרחק',
++  pointLineDistance: 'מרחק מקו',
++  lineDistance: 'מרחק בין קווים',
++  angle: 'זווית',
++  equalDistance: 'מרווחים שווים',
++}
++
++export const RELATION_LABEL_HE: Record<RelationKind, string> = {
++  columnOnAxis: 'עמוד על ציר',
++  columnAtCorner: 'עמוד בפינת קיר',
++  offsetFromWall: 'מרחק מקיר',
++  beamBetween: 'קורה בין תמיכות',
++  alignTo: 'יישור לפי',
++  divide: 'חלוקה',
++  roofOverhang: 'בליטת גג',
++}
++
++export const OBJECT_LABEL_HE: Record<ObjectKind, string> = {
++  wall: 'קיר',
++  column: 'עמוד',
++  beam: 'קורה',
++  opening: 'פתח',
++  roofOutline: 'מתאר גג',
++  roofEdge: 'קצה גג',
++  aux: 'קו עזר',
++}
++
++export const ROLE_LABEL_HE: Record<StructuralRole, string> = {
++  bearing: 'נושא',
++  'non-bearing': 'לא נושא',
++  none: 'ללא תפקיד מבני',
++}
+diff --git a/src/parametric/objects.ts b/src/parametric/objects.ts
+new file mode 100644
+index 0000000..bdaf8e3
+--- /dev/null
++++ b/src/parametric/objects.ts
+@@ -0,0 +1,136 @@
++// src/parametric/objects.ts
++// Semantic-object geometry helpers (owner brief §2). PURE. Everything here
++// DERIVES drawing geometry from the sketch (never stores it): a wall's body
++// polygon from its line + thickness, a column's rectangle from its point +
++// section, an opening's footprint from its wall. Also the face-offset math
++// relations.ts needs ("מרחק מפני הקיר, ולא רק מקו המרכז שלו").
++import type { Pt, SketchDoc, SketchObject, WallFaceRef, WallObject } from './model'
++import { lineById, pointById } from './model'
++import { add, leftNormal, lerp, scale, signedDist, sub, unit } from './geom'
++
++export interface Seg { a: Pt; b: Pt }
++
++export function lineSeg(doc: SketchDoc, lineId: string, positions?: ReadonlyMap<string, Pt>): Seg | null {
++  const l = lineById(doc, lineId)
++  if (!l) return null
++  const a = positions?.get(l.a) ?? pointById(doc, l.a)
++  const b = positions?.get(l.b) ?? pointById(doc, l.b)
++  if (!a || !b) return null
++  return { a: { x: a.x, y: a.y }, b: { x: b.x, y: b.y } }
++}
++
++/** Half-width of an object's body across its line (walls: thickness/2,
++ *  beams: section width/2, everything else 0). */
++export function halfWidthM(o: SketchObject): number {
++  if (o.kind === 'wall') return o.thicknessM / 2
++  if (o.kind === 'beam') return o.sectionWmm / 2000
++  return 0
++}
++
++/** Position of a reference line (center / faceA / faceB) along the LEFT
++ *  normal of the object's own sketch line, relative to the CENTER. */
++function refPos(o: SketchObject, ref: WallFaceRef): number {
++  const h = halfWidthM(o)
++  return ref === 'faceA' ? h : ref === 'faceB' ? -h : 0
++}
++
++/** Where the object's sketch line sits relative to its center (walls can be
++ *  drawn along a face; beams/aux are always on center). */
++function linePos(o: SketchObject): number {
++  if (o.kind === 'wall') return refPos(o, o.lineIs)
++  return 0
++}
++
++/** Signed offset (meters, along the left normal of the object's sketch line)
++ *  from the SKETCH LINE to the requested reference line. A constraint that
++ *  wants "distance d from faceA" measures sdist(p, line) == d + offsetOf(...). */
++export function offsetOf(o: SketchObject, ref: WallFaceRef): number {
++  return refPos(o, ref) - linePos(o)
++}
++
++/** The exterior-wall OUTER side: +1 when the outside lies on the left
++ *  (faceA) side of a→b, −1 when on the right. Decided against the centroid
++ *  of every exterior wall endpoint (the building interior) — never a stored
++ *  guess, so re-drawing a wall the other way round stays correct. Falls back
++ *  to −1 (CCW ring convention: interior on the left) when undecidable. */
++export function outerSign(doc: SketchDoc, wall: WallObject, positions?: ReadonlyMap<string, Pt>): 1 | -1 {
++  const ext = doc.objects.filter((o): o is WallObject => o.kind === 'wall' && o.wallType === 'exterior')
++  const pts: Pt[] = []
++  for (const w of ext) {
++    const s = lineSeg(doc, w.line, positions)
++    if (s) pts.push(s.a, s.b)
++  }
++  const seg = lineSeg(doc, wall.line, positions)
++  if (!seg || pts.length < 3) return -1
++  const c = pts.reduce((acc, p) => add(acc, p), { x: 0, y: 0 })
++  const centroid = scale(c, 1 / pts.length)
++  const d = signedDist(centroid, seg.a, seg.b)
++  if (Math.abs(d) < 1e-9) return -1
++  return d > 0 ? -1 : 1
++}
++
++/** The two body edges of a wall/beam (left face first), in plan. */
++export function bodyFaces(doc: SketchDoc, o: SketchObject, positions?: ReadonlyMap<string, Pt>): { faceA: Seg; faceB: Seg; center: Seg } | null {
++  const lineId = o.kind === 'wall' || o.kind === 'beam' ? o.line : null
++  if (!lineId) return null
++  const s = lineSeg(doc, lineId, positions)
++  if (!s) return null
++  const n = leftNormal(s.a, s.b)
++  const offA = offsetOf(o, 'faceA')
++  const offB = offsetOf(o, 'faceB')
++  const offC = offsetOf(o, 'center')
++  const shift = (seg: Seg, k: number): Seg => ({ a: add(seg.a, scale(n, k)), b: add(seg.b, scale(n, k)) })
++  return { faceA: shift(s, offA), faceB: shift(s, offB), center: shift(s, offC) }
++}
++
++/** Wall/beam body polygon (4 points). */
++export function bodyPolygon(doc: SketchDoc, o: SketchObject, positions?: ReadonlyMap<string, Pt>): Pt[] | null {
++  const f = bodyFaces(doc, o, positions)
++  if (!f) return null
++  return [f.faceA.a, f.faceA.b, f.faceB.b, f.faceB.a]
++}
++
++/** Column rectangle (4 points) around its center point. */
++export function columnPolygon(doc: SketchDoc, o: SketchObject, positions?: ReadonlyMap<string, Pt>): Pt[] | null {
++  if (o.kind !== 'column') return null
++  const c = positions?.get(o.point) ?? pointById(doc, o.point)
++  if (!c) return null
++  const w = o.sectionWmm / 2000
++  const h = o.sectionHmm / 2000
++  const r = (o.rotationDeg * Math.PI) / 180
++  const cos = Math.cos(r)
++  const sin = Math.sin(r)
++  const corner = (dx: number, dy: number): Pt => ({ x: c.x + dx * cos - dy * sin, y: c.y + dx * sin + dy * cos })
++  return [corner(-w, -h), corner(w, -h), corner(w, h), corner(-w, h)]
++}
++
++/** Opening footprint on its wall: the segment along the wall's center line
++ *  plus the body polygon it cuts. Null when the wall is missing. */
++export function openingGeometry(doc: SketchDoc, o: SketchObject, positions?: ReadonlyMap<string, Pt>): { seg: Seg; polygon: Pt[] } | null {
++  if (o.kind !== 'opening') return null
++  const wall = doc.objects.find((w) => w.id === o.wall)
++  if (!wall || wall.kind !== 'wall') return null
++  const faces = bodyFaces(doc, wall, positions)
++  if (!faces) return null
++  const c = faces.center
++  const d = sub(c.b, c.a)
++  const L = Math.hypot(d.x, d.y)
++  if (L < 1e-9) return null
++  const u = unit(d)
++  const t0 = Math.max(0, Math.min(L, o.offsetM - o.widthM / 2))
++  const t1 = Math.max(0, Math.min(L, o.offsetM + o.widthM / 2))
++  const n = leftNormal(c.a, c.b)
++  const h = halfWidthM(wall)
++  const p0 = add(c.a, scale(u, t0))
++  const p1 = add(c.a, scale(u, t1))
++  return {
++    seg: { a: p0, b: p1 },
++    polygon: [add(p0, scale(n, h)), add(p1, scale(n, h)), add(p1, scale(n, -h)), add(p0, scale(n, -h))],
++  }
++}
++
++/** A point along a line at parameter t (0..1). */
++export function pointAlong(doc: SketchDoc, lineId: string, t: number, positions?: ReadonlyMap<string, Pt>): Pt | null {
++  const s = lineSeg(doc, lineId, positions)
++  return s ? lerp(s.a, s.b, t) : null
++}
+diff --git a/src/parametric/persist.ts b/src/parametric/persist.ts
+new file mode 100644
+index 0000000..39a9290
+--- /dev/null
++++ b/src/parametric/persist.ts
+@@ -0,0 +1,68 @@
++// src/parametric/persist.ts
++// Sketch document (de)serialization + structural validation. The doc lives
++// INSIDE the roof snapshot (RoofModel.parametricSketch → Block.roofModel →
++// useProject's localStorage store) so it rides the project's existing
++// autosave/undo/history machinery; it also round-trips as a standalone JSON
++// string (export / tests). Same doctrine as roofwizard/persist.ts: never
++// silently discard unrecognised data — a doc that fails validation is
++// reported, not replaced.
++import { defaultLayers, emptyDoc, LAYER_KEYS, SKETCH_DOC_VERSION, type SketchDoc } from './model'
++
++const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null
++const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
++const isStr = (x: unknown): x is string => typeof x === 'string' && x.length > 0
++
++export function isSketchDoc(x: unknown): x is SketchDoc {
++  if (!isObj(x)) return false
++  if (!isNum(x.v)) return false
++  if (!Array.isArray(x.points) || !x.points.every((p) => isObj(p) && isStr(p.id) && isNum(p.x) && isNum(p.y))) return false
++  if (!Array.isArray(x.lines) || !x.lines.every((l) => isObj(l) && isStr(l.id) && isStr(l.a) && isStr(l.b))) return false
++  for (const k of ['constraints', 'dimensions', 'objects', 'relations', 'levels'] as const) {
++    if (!Array.isArray(x[k]) || !(x[k] as unknown[]).every((e) => isObj(e) && isStr(e.id))) return false
++  }
++  if (!isObj(x.layers)) return false
++  if (!isNum(x.seq)) return false
++  return true
++}
++
++/** Fill layers added after a doc was saved (additive, same doctrine as
++ *  RoofModel optional fields). */
++export function hydrateDoc(doc: SketchDoc): SketchDoc {
++  const base = defaultLayers()
++  const layers = { ...base }
++  for (const k of LAYER_KEYS) {
++    const v = (doc.layers as Partial<Record<string, { visible?: unknown; locked?: unknown }>>)[k]
++    layers[k] = {
++      visible: typeof v?.visible === 'boolean' ? v.visible : base[k].visible,
++      locked: typeof v?.locked === 'boolean' ? v.locked : base[k].locked,
++    }
++  }
++  return { ...doc, layers, v: SKETCH_DOC_VERSION }
++}
++
++export function serializeDoc(doc: SketchDoc): string {
++  return JSON.stringify(doc)
++}
++
++export type ParseResult = { ok: true; doc: SketchDoc } | { ok: false; message: string }
++
++export function parseDoc(json: string): ParseResult {
++  let raw: unknown
++  try {
++    raw = JSON.parse(json)
++  } catch {
++    return { ok: false, message: 'קובץ השרטוט אינו JSON תקין' }
++  }
++  return restoreDoc(raw)
++}
++
++export function restoreDoc(raw: unknown): ParseResult {
++  if (raw === undefined || raw === null) return { ok: true, doc: emptyDoc() }
++  if (!isSketchDoc(raw)) return { ok: false, message: 'מבנה השרטוט השמור לא זוהה — נפתח שרטוט ריק, הנתונים המקוריים לא נמחקו' }
++  if (raw.v > SKETCH_DOC_VERSION) return { ok: false, message: 'השרטוט נשמר בגרסה חדשה יותר של האפליקציה' }
++  return { ok: true, doc: hydrateDoc(structuredClone(raw)) }
++}
++
++/** Standalone browser key (the sketcher outside a roof block, e.g. a future
++ *  dedicated screen). Inside RoofWizard the doc is saved with the roof. */
++export const STANDALONE_KEY = 'brazwood_parametric_sketch_v1'
+diff --git a/src/parametric/relations.ts b/src/parametric/relations.ts
+new file mode 100644
+index 0000000..886b580
+--- /dev/null
++++ b/src/parametric/relations.ts
+@@ -0,0 +1,189 @@
++// src/parametric/relations.ts
++// STRUCTURAL RELATIONS → CONSTRAINTS (owner brief §3). PURE. Every relation
++// compiles into one or more solver constraints whose ids are
++// `${relationId}~${k}` (analysis.ts maps them back for highlighting). The
++// compile runs fresh on EVERY settle (doc.ts) so a thickness / section edit
++// on a wall or beam re-derives the face offsets — nothing is copied.
++import type { Constraint, SketchDoc, SketchObject, WallFaceRef } from './model'
++import { objectById } from './model'
++import { offsetOf, outerSign } from './objects'
++
++export const REL_SEP = '~'
++
++export interface CompileIssue {
++  relationId: string
++  /** Hebrew, shown next to the relation in the panel. */
++  message: string
++}
++
++function lineOf(o: SketchObject | undefined): string | null {
++  if (!o) return null
++  if (o.kind === 'wall' || o.kind === 'beam' || o.kind === 'aux' || o.kind === 'roofEdge') return o.line
++  return null
++}
++
++function refOffset(o: SketchObject, ref: WallFaceRef): number {
++  return offsetOf(o, ref)
++}
++
++/** Compile every relation. Constraints referencing missing objects are
++ *  skipped and reported — a relation never silently disappears (it stays in
++ *  the list, flagged), the user decides. */
++export function compileRelations(doc: SketchDoc): { constraints: Constraint[]; issues: CompileIssue[] } {
++  const out: Constraint[] = []
++  const issues: CompileIssue[] = []
++  for (const r of doc.relations) {
++    let k = 0
++    const cid = (): string => `${r.id}${REL_SEP}${k++}`
++    const fail = (message: string): void => {
++      issues.push({ relationId: r.id, message })
++    }
++    switch (r.kind) {
++      case 'columnOnAxis': {
++        const col = objectById(doc, r.column)
++        const ax = objectById(doc, r.line)
++        const line = lineOf(ax)
++        if (!col || col.kind !== 'column' || !line) {
++          fail('עמוד או ציר חסרים')
++          break
++        }
++        out.push({ id: cid(), kind: 'pointOnLine', p: col.point, line })
++        break
++      }
++      case 'columnAtCorner': {
++        const col = objectById(doc, r.column)
++        const wa = objectById(doc, r.wallA)
++        const wb = objectById(doc, r.wallB)
++        if (!col || col.kind !== 'column' || !wa || wa.kind !== 'wall' || !wb || wb.kind !== 'wall') {
++          fail('עמוד או קיר חסרים')
++          break
++        }
++        out.push({ id: cid(), kind: 'pointLineDistance', p: col.point, line: wa.line, valueM: r.distA, offsetM: refOffset(wa, r.refA) })
++        out.push({ id: cid(), kind: 'pointLineDistance', p: col.point, line: wb.line, valueM: r.distB, offsetM: refOffset(wb, r.refB) })
++        break
++      }
++      case 'offsetFromWall': {
++        const t = objectById(doc, r.target)
++        const w = objectById(doc, r.wall)
++        if (!t || !w || w.kind !== 'wall') {
++          fail('יעד או קיר חסרים')
++          break
++        }
++        if (t.kind === 'column') {
++          out.push({ id: cid(), kind: 'pointLineDistance', p: t.point, line: w.line, valueM: r.distM, offsetM: refOffset(w, r.ref) })
++        } else {
++          const tl = lineOf(t)
++          if (!tl) {
++            fail('ליעד אין קו')
++            break
++          }
++          out.push({ id: cid(), kind: 'lineDistance', a: w.line, b: tl, valueM: r.distM, offsetM: refOffset(w, r.ref) })
++        }
++        break
++      }
++      case 'beamBetween': {
++        const beam = objectById(doc, r.beam)
++        if (!beam || beam.kind !== 'beam') {
++          fail('הקורה חסרה')
++          break
++        }
++        const bl = doc.lines.find((l) => l.id === beam.line)
++        if (!bl) {
++          fail('לקורה אין קו')
++          break
++        }
++        const ends: [string, string][] = [
++          [bl.a, r.supportA],
++          [bl.b, r.supportB],
++        ]
++        for (const [endPoint, supportId] of ends) {
++          const s = objectById(doc, supportId)
++          if (!s) {
++            fail('תמיכה חסרה')
++            continue
++          }
++          if (s.kind === 'column') out.push({ id: cid(), kind: 'coincident', p: endPoint, q: s.point })
++          else {
++            const sl = lineOf(s)
++            if (!sl) {
++              fail('לתמיכה אין קו')
++              continue
++            }
++            out.push({ id: cid(), kind: 'pointOnLine', p: endPoint, line: sl })
++          }
++        }
++        break
++      }
++      case 'alignTo': {
++        const t = objectById(doc, r.target)
++        const ref = objectById(doc, r.reference)
++        const tl = lineOf(t)
++        const rl = lineOf(ref)
++        if (!t || !ref || !tl || !rl) {
++          fail('יעד או ייחוס חסרים')
++          break
++        }
++        // The target's own center must sit at gap from the reference line:
++        // the target's sketch line may itself be a face (walls), so correct
++        // for that too — offset(ref line) minus offset(target line from its
++        // center) keeps "gap" a center-to-reference distance.
++        const targetLineOffset = offsetOf(t, 'center')
++        out.push({ id: cid(), kind: 'lineDistance', a: rl, b: tl, valueM: r.gapM, offsetM: refOffset(ref, r.ref) - targetLineOffset })
++        break
++      }
++      case 'divide': {
++        const cols = r.columns.map((id) => objectById(doc, id))
++        if (cols.some((c) => !c || c.kind !== 'column')) {
++          fail('עמוד חסר בחלוקה')
++          break
++        }
++        const pts = cols.map((c) => (c as { point: string }).point)
++        const chain = [r.boundA, ...pts, r.boundB]
++        const guide = doc.lines.find((l) => l.id === `${r.id}${REL_SEP}line`)
++        if (!guide) {
++          fail('קו החלוקה חסר')
++          break
++        }
++        for (const p of pts) out.push({ id: cid(), kind: 'pointOnLine', p, line: guide.id })
++        if (r.by === 'count') {
++          for (let i = 0; i + 2 < chain.length; i++) {
++            out.push({ id: cid(), kind: 'equalDistance', p: chain[i]!, q: chain[i + 1]!, r: chain[i + 1]!, s: chain[i + 2]! })
++          }
++        } else {
++          const s = r.spacingM ?? 0
++          if (!(s > 0)) {
++            fail('מרווח החלוקה חייב להיות חיובי')
++            break
++          }
++          for (let i = 0; i + 1 < chain.length - 1; i++) {
++            out.push({ id: cid(), kind: 'pointDistance', p: chain[i]!, q: chain[i + 1]!, valueM: s })
++          }
++        }
++        break
++      }
++      case 'roofOverhang': {
++        const edge = objectById(doc, r.roofEdge)
++        const wall = objectById(doc, r.wall)
++        const el = lineOf(edge)
++        if (!edge || !wall || wall.kind !== 'wall' || !el) {
++          fail('קצה גג או קיר חסרים')
++          break
++        }
++        const sign = outerSign(doc, wall)
++        const outerFace: WallFaceRef = sign > 0 ? 'faceA' : 'faceB'
++        out.push({
++          id: cid(),
++          kind: 'lineDistance',
++          a: wall.line,
++          b: el,
++          valueM: sign * r.overhangM,
++          offsetM: refOffset(wall, outerFace),
++        })
++        break
++      }
++    }
++  }
++  return { constraints: out, issues }
++}
++
++export const isRelationConstraintId = (cid: string): boolean => cid.includes(REL_SEP)
+diff --git a/src/parametric/roofBridge.ts b/src/parametric/roofBridge.ts
+new file mode 100644
+index 0000000..3ebbd9f
+--- /dev/null
++++ b/src/parametric/roofBridge.ts
+@@ -0,0 +1,197 @@
++// src/parametric/roofBridge.ts
++// SKETCH → ROOF (owner brief §6: "הגג יוכל להסתמך על קירות, קורות ועמודים
++// שהוגדרו, ויהיה ברור על אילו רכיבים הוא נשען"). PURE. Derives the roof's
++// footprint ring (meters, plan frame — the SAME frame as RoofModel.contour)
++// and the list of supporting objects from the sketch:
++//   1. an explicit roofOutline object (a closed loop of lines) wins;
++//   2. otherwise the EXTERIOR walls' OUTER faces, intersected corner by
++//      corner (the roof sits on the outside of the walls — this is what the
++//      existing free-walls engine expects as "the contour").
++// Per-edge overhang requests come from roofOverhang relations. The RoofModel
++// side (state.ts 'adoptParametricSketch') owns everything after this.
++import type { Pt, SketchDoc, WallObject } from './model'
++import { lineById, objectById, pointById } from './model'
++import { bodyFaces, lineSeg, outerSign } from './objects'
++import { lineIntersection, signedArea } from './geom'
++
++export interface RoofDerivation {
++  ok: true
++  source: 'roofOutline' | 'exteriorWalls'
++  /** CCW ring, no repeated closing point. */
++  ring: Pt[]
++  /** Object ids the roof rests on (walls on the ring + bearing members). */
++  supports: string[]
++  /** Per ring edge (edge k = ring[k]→ring[k+1]): the wall object it comes
++   *  from (exteriorWalls source) or null. */
++  edgeWalls: (string | null)[]
++  /** Per ring edge: overhang requested by a roofOverhang relation, or null. */
++  edgeOverhangM: (number | null)[]
++}
++
++export type RoofDerivationResult = RoofDerivation | { ok: false; message: string }
++
++/** Union-find over point ids merged by coincident constraints, so a loop
++ *  drawn with "coincident" joints (not shared ids) still closes. */
++function pointClasses(doc: SketchDoc): Map<string, string> {
++  const parent = new Map<string, string>()
++  const find = (x: string): string => {
++    let r = x
++    while (parent.get(r) !== undefined && parent.get(r) !== r) r = parent.get(r)!
++    return r
++  }
++  for (const p of doc.points) parent.set(p.id, p.id)
++  for (const c of doc.constraints) {
++    if (c.kind !== 'coincident') continue
++    const a = find(c.p)
++    const b = find(c.q)
++    if (a !== b) parent.set(a, b)
++  }
++  const out = new Map<string, string>()
++  for (const p of doc.points) out.set(p.id, find(p.id))
++  return out
++}
++
++/** Order a set of lines into one closed loop (by shared endpoints). Null
++ *  when they do not form exactly one simple loop. */
++export function orderLoop(doc: SketchDoc, lineIds: readonly string[]): string[] | null {
++  if (lineIds.length < 3) return null
++  const cls = pointClasses(doc)
++  const ends = new Map<string, [string, string]>()
++  for (const id of lineIds) {
++    const l = lineById(doc, id)
++    if (!l) return null
++    ends.set(id, [cls.get(l.a) ?? l.a, cls.get(l.b) ?? l.b])
++  }
++  const degree = new Map<string, number>()
++  for (const [a, b] of ends.values()) {
++    degree.set(a, (degree.get(a) ?? 0) + 1)
++    degree.set(b, (degree.get(b) ?? 0) + 1)
++  }
++  for (const d of degree.values()) if (d !== 2) return null
++  const remaining = new Set(lineIds)
++  const first = lineIds[0]!
++  const order = [first]
++  remaining.delete(first)
++  let cursor = ends.get(first)![1]
++  const start = ends.get(first)![0]
++  while (remaining.size > 0) {
++    let found: string | null = null
++    for (const id of remaining) {
++      const [a, b] = ends.get(id)!
++      if (a === cursor || b === cursor) {
++        found = id
++        cursor = a === cursor ? b : a
++        break
++      }
++    }
++    if (!found) return null
++    order.push(found)
++    remaining.delete(found)
++  }
++  return cursor === start ? order : null
++}
++
++function ringFromLoop(doc: SketchDoc, loop: readonly string[]): Pt[] | null {
++  const cls = pointClasses(doc)
++  const ring: Pt[] = []
++  let cursor: string | null = null
++  for (let i = 0; i < loop.length; i++) {
++    const l = lineById(doc, loop[i]!)
++    if (!l) return null
++    const a = cls.get(l.a) ?? l.a
++    const b = cls.get(l.b) ?? l.b
++    let startId: string
++    if (cursor === null) {
++      // Orient the first line so that it connects to the second one.
++      const n = lineById(doc, loop[1]!)
++      const nA = n ? cls.get(n.a) ?? n.a : ''
++      const nB = n ? cls.get(n.b) ?? n.b : ''
++      startId = b === nA || b === nB ? l.a : l.b
++    } else {
++      startId = a === cursor ? l.a : l.b
++    }
++    const p = pointById(doc, startId)
++    if (!p) return null
++    ring.push({ x: p.x, y: p.y })
++    cursor = cls.get(startId === l.a ? l.b : l.a) ?? (startId === l.a ? l.b : l.a)
++  }
++  return ring
++}
++
++function exteriorWalls(doc: SketchDoc): WallObject[] {
++  return doc.objects.filter((o): o is WallObject => o.kind === 'wall' && o.wallType === 'exterior')
++}
++
++function overhangFor(doc: SketchDoc, wallId: string): number | null {
++  const r = doc.relations.find((x) => x.kind === 'roofOverhang' && x.wall === wallId)
++  return r && r.kind === 'roofOverhang' ? r.overhangM : null
++}
++
++function bearingSupports(doc: SketchDoc): string[] {
++  return doc.objects.filter((o) => o.role === 'bearing' && (o.kind === 'wall' || o.kind === 'column' || o.kind === 'beam')).map((o) => o.id)
++}
++
++export function deriveRoof(doc: SketchDoc): RoofDerivationResult {
++  const outline = doc.objects.find((o) => o.kind === 'roofOutline')
++  if (outline && outline.kind === 'roofOutline') {
++    const loop = orderLoop(doc, outline.lines)
++    if (!loop) return { ok: false, message: 'מתאר הגג אינו לולאה סגורה אחת' }
++    let ring = ringFromLoop(doc, loop)
++    if (!ring) return { ok: false, message: 'מתאר הגג חסר נקודות' }
++    if (signedArea(ring) < 0) ring = ring.reverse()
++    const supports = [...new Set(bearingSupports(doc))]
++    return {
++      ok: true,
++      source: 'roofOutline',
++      ring,
++      supports,
++      edgeWalls: ring.map(() => null),
++      edgeOverhangM: ring.map(() => null),
++    }
++  }
++  const walls = exteriorWalls(doc)
++  if (walls.length < 3) return { ok: false, message: 'נדרשים לפחות שלושה קירות חוץ סגורים (או מתאר גג) כדי לבנות גג' }
++  const loop = orderLoop(doc, walls.map((w) => w.line))
++  if (!loop) return { ok: false, message: 'קירות החוץ אינם סוגרים לולאה אחת — חבר את הפינות' }
++  const wallByLine = new Map(walls.map((w) => [w.line, w] as const))
++  // Walk the loop and intersect consecutive OUTER faces.
++  const orderedWalls = loop.map((l) => wallByLine.get(l)!)
++  const faces = orderedWalls.map((w) => {
++    const f = bodyFaces(doc, w)
++    const sign = outerSign(doc, w)
++    const seg = f ? (sign > 0 ? f.faceA : f.faceB) : lineSeg(doc, w.line)!
++    return seg
++  })
++  const n = faces.length
++  const ring: Pt[] = []
++  for (let i = 0; i < n; i++) {
++    const prev = faces[(i - 1 + n) % n]!
++    const cur = faces[i]!
++    const x = lineIntersection(prev.a, prev.b, cur.a, cur.b)
++    if (!x) return { ok: false, message: `קירות ${orderedWalls[(i - 1 + n) % n]!.name} ו-${orderedWalls[i]!.name} מקבילים — אין פינה ביניהם` }
++    ring.push(x)
++  }
++  // ring[i] is the corner BETWEEN wall i-1 and wall i, so edge i (ring[i]→ring[i+1]) is wall i.
++  let order = orderedWalls
++  let finalRing = ring
++  if (signedArea(ring) < 0) {
++    finalRing = [...ring].reverse()
++    // Reversing the ring: edge k of the reversed ring is wall (n-1-k) ... rotate so edges line up.
++    // reversed ring: r'[k] = ring[n-1-k]; edge k = ring[n-1-k]→ring[n-2-k] = wall (n-2-k) reversed.
++    order = ring.map((_, k) => orderedWalls[(n - 2 - k + n) % n]!)
++  }
++  const supports = [...new Set([...order.map((w) => w.id), ...bearingSupports(doc)])]
++  return {
++    ok: true,
++    source: 'exteriorWalls',
++    ring: finalRing,
++    supports,
++    edgeWalls: order.map((w) => w.id),
++    edgeOverhangM: order.map((w) => overhangFor(doc, w.id)),
++  }
++}
++
++/** Human-readable support list for the roof panel ("הגג נשען על: ק1, ק2, ע1 …"). */
++export function supportNames(doc: SketchDoc, supports: readonly string[]): string[] {
++  return supports.map((id) => objectById(doc, id)?.name ?? id)
++}
+diff --git a/src/parametric/scenario.test.ts b/src/parametric/scenario.test.ts
+new file mode 100644
+index 0000000..bf8e02a
+--- /dev/null
++++ b/src/parametric/scenario.test.ts
+@@ -0,0 +1,295 @@
++// Owner brief §7 — the full flow, end to end, on the pure core:
++// exterior walls → interior wall → columns → bearing beam → dimensions and
++// relations → roof derivation; then: change a dimension / an angle and
++// verify structure + roof follow the relations; contradiction detection;
++// undo/redo; save and reopen.
++import { describe, expect, it } from 'vitest'
++import { initHistory, undoable } from '../roofwizard/history'
++import { evaluate, movedObjects, sketchReducer, type SketchAction } from './doc'
++import { emptyDoc, objectById, pointById, type SketchDoc } from './model'
++import { parseDoc, restoreDoc, serializeDoc } from './persist'
++import { deriveRoof } from './roofBridge'
++import { signedArea } from './geom'
++
++const reduce = (doc: SketchDoc, ...actions: SketchAction[]): SketchDoc => actions.reduce(sketchReducer, doc)
++
++const lastObject = (doc: SketchDoc) => doc.objects[doc.objects.length - 1]!
++
++/** Build the scenario: a 10×6 building, exterior walls on the outer face
++ *  (lineIs faceB → body to the left/inside of a CCW loop). */
++function buildScenario(): { doc: SketchDoc; ids: Record<string, string> } {
++  const ids: Record<string, string> = {}
++  let doc = emptyDoc()
++  // Exterior walls, CCW: (0,0)→(10,0)→(10,6)→(0,6)→back. Drawn with shared points.
++  doc = reduce(doc, { kind: 'addLine', a: { x: 0, y: 0 }, b: { x: 10, y: 0 }, auto: ['horizontal'], as: { kind: 'wall', wallType: 'exterior', lineIs: 'faceB' } })
++  ids.w1 = lastObject(doc).id
++  const l1 = doc.lines[0]!
++  doc = reduce(doc, { kind: 'addLine', a: { pointId: l1.b }, b: { x: 10, y: 6 }, auto: ['vertical'], as: { kind: 'wall', wallType: 'exterior', lineIs: 'faceB' } })
++  ids.w2 = lastObject(doc).id
++  const l2 = doc.lines[1]!
++  doc = reduce(doc, { kind: 'addLine', a: { pointId: l2.b }, b: { x: 0, y: 6 }, auto: ['horizontal'], as: { kind: 'wall', wallType: 'exterior', lineIs: 'faceB' } })
++  ids.w3 = lastObject(doc).id
++  const l3 = doc.lines[2]!
++  doc = reduce(doc, { kind: 'addLine', a: { pointId: l3.b }, b: { pointId: l1.a }, auto: ['vertical'], as: { kind: 'wall', wallType: 'exterior', lineIs: 'faceB' } })
++  ids.w4 = lastObject(doc).id
++  ids.l1 = l1.id
++  ids.l2 = l2.id
++  ids.l3 = l3.id
++  ids.l4 = doc.lines[3]!.id
++  ids.p1 = l1.a
++  ids.p2 = l1.b
++  ids.p3 = l2.b
++  ids.p4 = l3.b
++  // Fix the origin corner and dimension the two sides (driving).
++  doc = reduce(doc, { kind: 'addConstraint', c: { kind: 'fixed', p: ids.p1, x: 0, y: 0 } })
++  doc = reduce(doc, { kind: 'addDimension', dim: { kind: 'length', refs: [ids.l1], driving: true }, value: 10 })
++  ids.dLen = doc.dimensions[doc.dimensions.length - 1]!.id
++  doc = reduce(doc, { kind: 'addDimension', dim: { kind: 'length', refs: [ids.l2], driving: true }, value: 6 })
++  ids.dWid = doc.dimensions[doc.dimensions.length - 1]!.id
++  // Interior wall: a vertical wall at x=4, parallel to w4 at a fixed distance (relation offsetFromWall).
++  doc = reduce(doc, { kind: 'addLine', a: { x: 4, y: 0 }, b: { x: 4, y: 6 }, as: { kind: 'wall', wallType: 'interior', thicknessM: 0.15 } })
++  ids.wInt = lastObject(doc).id
++  const lInt = doc.lines[4]!
++  ids.lInt = lInt.id
++  doc = reduce(doc, { kind: 'addConstraint', c: { kind: 'pointOnLine', p: lInt.a, line: ids.l1 } })
++  doc = reduce(doc, { kind: 'addConstraint', c: { kind: 'pointOnLine', p: lInt.b, line: ids.l3 } })
++  doc = reduce(doc, { kind: 'addRelation', relation: { kind: 'offsetFromWall', target: ids.wInt, wall: ids.w4, ref: 'faceA', distM: 4 } })
++  ids.rInt = doc.relations[doc.relations.length - 1]!.id
++  // Columns: one at the corner of w1/w2 (inside), one centered between w2 and the interior wall.
++  doc = reduce(doc, { kind: 'addColumn', at: { x: 9.5, y: 0.5 } })
++  ids.cCorner = lastObject(doc).id
++  doc = reduce(doc, { kind: 'addRelation', relation: { kind: 'columnAtCorner', column: ids.cCorner, wallA: ids.w1, wallB: ids.w2, refA: 'faceA', refB: 'faceA', distA: 0.2, distB: 0.2 } })
++  ids.rCorner = doc.relations[doc.relations.length - 1]!.id
++  doc = reduce(doc, { kind: 'addColumn', at: { x: 7, y: 3 } })
++  ids.cMid = lastObject(doc).id
++  const cMid = objectById(doc, ids.cMid)!
++  if (cMid.kind !== 'column') throw new Error('column expected')
++  ids.cMidPt = cMid.point
++  doc = reduce(doc, { kind: 'addConstraint', c: { kind: 'centered', p: ids.cMidPt, a: ids.l2, b: ids.lInt } })
++  doc = reduce(doc, { kind: 'addConstraint', c: { kind: 'centered', p: ids.cMidPt, a: ids.l1, b: ids.l3 } })
++  // Bearing beam from the corner column to the middle column.
++  doc = reduce(doc, { kind: 'addLine', a: { x: 9.5, y: 0.5 }, b: { x: 7, y: 3 }, as: { kind: 'beam' } })
++  ids.beam = lastObject(doc).id
++  doc = reduce(doc, { kind: 'addRelation', relation: { kind: 'beamBetween', beam: ids.beam, supportA: ids.cCorner, supportB: ids.cMid } })
++  ids.rBeam = doc.relations[doc.relations.length - 1]!.id
++  // A roof overhang request on w1 (0.5 m) via a roof edge line.
++  doc = reduce(doc, { kind: 'addLine', a: { x: -1, y: -0.5 }, b: { x: 11, y: -0.5 }, as: { kind: 'roofEdge', edgeType: 'eave' } })
++  ids.edge = lastObject(doc).id
++  doc = reduce(doc, { kind: 'addRelation', relation: { kind: 'roofOverhang', roofEdge: ids.edge, wall: ids.w1, overhangM: 0.5 } })
++  return { doc, ids }
++}
++
++describe('parametric scenario (owner brief §7)', () => {
++  it('builds the full flow with every relation satisfied', () => {
++    const { doc, ids } = buildScenario()
++    const ev = evaluate(doc)
++    expect(ev.solved.ok).toBe(true)
++    expect(ev.analysis.conflicts).toEqual([])
++    expect(ev.issues).toEqual([])
++    // Corner column: 0.2 m inside both faces (w1 thickness 0.25, line is faceB → faceA is +0.25).
++    const pc = pointById(doc, (objectById(doc, ids.cCorner) as { point: string }).point)!
++    expect(pc.y).toBeCloseTo(0.25 + 0.2, 6)
++    expect(pc.x).toBeCloseTo(10 - 0.25 - 0.2, 6)
++    // Interior wall line 4 m from w4's faceA (w4 runs (0,6)→(0,0); faceA = left = +x side; 0.25 + 4).
++    const lInt = doc.lines.find((l) => l.id === ids.lInt)!
++    expect(pointById(doc, lInt.a)!.x).toBeCloseTo(4.25, 6)
++    // Middle column centered between w2's line (x=10) and the interior line (x=4.25), and between y=0 and y=6.
++    const pm = pointById(doc, ids.cMidPt)!
++    expect(pm.x).toBeCloseTo((10 + 4.25) / 2, 5)
++    expect(pm.y).toBeCloseTo(3, 5)
++    // Beam ends sit on both columns and the beam records its supports.
++    const beam = objectById(doc, ids.beam)!
++    if (beam.kind !== 'beam') throw new Error('beam expected')
++    expect(beam.supports.sort()).toEqual([ids.cCorner, ids.cMid].sort())
++    const bl = doc.lines.find((l) => l.id === beam.line)!
++    expect(pointById(doc, bl.a)).toMatchObject({ x: expect.closeTo(pc.x, 6), y: expect.closeTo(pc.y, 6) })
++    expect(pointById(doc, bl.b)).toMatchObject({ x: expect.closeTo(pm.x, 6), y: expect.closeTo(pm.y, 6) })
++    // Roof edge 0.5 m outside w1's outer face (faceB == the sketch line at y=0 → y = -0.5).
++    const edge = objectById(doc, ids.edge)!
++    if (edge.kind !== 'roofEdge') throw new Error('edge expected')
++    const el = doc.lines.find((l) => l.id === edge.line)!
++    expect(pointById(doc, el.a)!.y).toBeCloseTo(-0.5, 6)
++    expect(pointById(doc, el.b)!.y).toBeCloseTo(-0.5, 6)
++  })
++
++  it('derives the roof ring from the exterior walls with the overhang request per edge', () => {
++    const { doc, ids } = buildScenario()
++    const roof = deriveRoof(doc)
++    expect(roof.ok).toBe(true)
++    if (!roof.ok) return
++    expect(roof.source).toBe('exteriorWalls')
++    expect(roof.ring.length).toBe(4)
++    expect(signedArea(roof.ring)).toBeCloseTo(60, 6)
++    expect(roof.supports).toContain(ids.w1)
++    expect(roof.supports).toContain(ids.beam)
++    expect(roof.supports).toContain(ids.cCorner)
++    const k = roof.edgeWalls.indexOf(ids.w1)
++    expect(k).toBeGreaterThanOrEqual(0)
++    expect(roof.edgeOverhangM[k]).toBe(0.5)
++  })
++
++  it('SUCCESS TEST: changing the width dimension updates walls, interior wall, columns, beam and roof — no relation lost', () => {
++    const { doc, ids } = buildScenario()
++    const next = sketchReducer(doc, { kind: 'setDimensionValue', id: ids.dLen, value: 14 })
++    const ev = evaluate(next)
++    expect(ev.solved.ok).toBe(true)
++    expect(next.relations.length).toBe(doc.relations.length)
++    expect(next.constraints.length).toBe(doc.constraints.length)
++    // Walls: w2 moved to x=14.
++    expect(pointById(next, ids.p2)!.x).toBeCloseTo(14, 6)
++    expect(pointById(next, ids.p3)!.x).toBeCloseTo(14, 6)
++    // Interior wall stayed at 4.25 (fixed distance from w4), parallel.
++    const lInt = next.lines.find((l) => l.id === ids.lInt)!
++    expect(pointById(next, lInt.a)!.x).toBeCloseTo(4.25, 6)
++    expect(pointById(next, lInt.b)!.x).toBeCloseTo(4.25, 6)
++    // Corner column followed the corner.
++    const pc = pointById(next, (objectById(next, ids.cCorner) as { point: string }).point)!
++    expect(pc.x).toBeCloseTo(14 - 0.45, 6)
++    // Middle column stayed centered between w2 and the interior wall.
++    expect(pointById(next, ids.cMidPt)!.x).toBeCloseTo((14 + 4.25) / 2, 5)
++    // Beam still spans the two columns.
++    const beam = objectById(next, ids.beam)!
++    if (beam.kind !== 'beam') throw new Error('beam')
++    const bl = next.lines.find((l) => l.id === beam.line)!
++    expect(pointById(next, bl.a)!.x).toBeCloseTo(pc.x, 6)
++    expect(pointById(next, bl.b)!.x).toBeCloseTo((14 + 4.25) / 2, 5)
++    // Roof follows.
++    const roof = deriveRoof(next)
++    expect(roof.ok).toBe(true)
++    if (roof.ok) expect(signedArea(roof.ring)).toBeCloseTo(14 * 6, 6)
++    // Preview reports the affected objects honestly.
++    const moved = movedObjects(doc, next)
++    expect(moved).toContain(ids.w2)
++    expect(moved).toContain(ids.cCorner)
++    expect(moved).toContain(ids.cMid)
++    expect(moved).toContain(ids.beam)
++    expect(moved).not.toContain(ids.w4)
++  })
++
++  it('SUCCESS TEST: changing an angle keeps every relation', () => {
++    const { doc, ids } = buildScenario()
++    // Replace w2's 'vertical' with an angle dimension of 80° from w1, then skew.
++    const vert = doc.constraints.find((c) => c.kind === 'vertical' && c.line === ids.l2)!
++    let next = sketchReducer(doc, { kind: 'removeConstraint', id: vert.id })
++    next = sketchReducer(next, { kind: 'addDimension', dim: { kind: 'angle', refs: [ids.l1, ids.l2], driving: true }, value: 80 })
++    const ev = evaluate(next)
++    expect(ev.solved.ok).toBe(true)
++    const p2 = pointById(next, ids.p2)!
++    const p3 = pointById(next, ids.p3)!
++    const ang = (Math.atan2(p3.y - p2.y, p3.x - p2.x) * 180) / Math.PI
++    expect(ang).toBeCloseTo(80, 5)
++    expect(Math.hypot(p3.x - p2.x, p3.y - p2.y)).toBeCloseTo(6, 6)
++    // Corner column still 0.2 m from both faces; beam still on both columns.
++    const pc = pointById(next, (objectById(next, ids.cCorner) as { point: string }).point)!
++    expect(pc.y).toBeCloseTo(0.45, 6)
++    const beam = objectById(next, ids.beam)!
++    if (beam.kind !== 'beam') throw new Error('beam')
++    const bl = next.lines.find((l) => l.id === beam.line)!
++    expect(pointById(next, bl.a)).toMatchObject({ x: expect.closeTo(pc.x, 6), y: expect.closeTo(pc.y, 6) })
++    expect(deriveRoof(next).ok).toBe(true)
++  })
++
++  it('a contradicting dimension is kept, flagged, and the geometry stays at the last consistent state', () => {
++    const { doc, ids } = buildScenario()
++    // w3 is parallel to w1 across the same span: dimensioning it to 12 contradicts length(w1)=10.
++    const next = sketchReducer(doc, { kind: 'addDimension', dim: { kind: 'length', refs: [ids.l3], driving: true }, value: 12 })
++    expect(next.dimensions.length).toBe(doc.dimensions.length + 1) // kept, not dropped
++    expect(next.constraints.length).toBe(doc.constraints.length + 1)
++    // Geometry unchanged.
++    expect(pointById(next, ids.p3)!.x).toBeCloseTo(10, 9)
++    const ev = evaluate(next)
++    expect(ev.solved.ok).toBe(false)
++    expect(ev.analysis.conflicts.length).toBeGreaterThan(0)
++    const newDim = next.dimensions[next.dimensions.length - 1]!
++    expect(ev.analysis.status.get(newDim.constraintId!)).toBe('conflict')
++    expect(ev.analysis.conflictObjects.has(ids.w3)).toBe(true)
++    // Removing the offending dimension restores a consistent sketch — the user's choice, not the app's.
++    const fixed = sketchReducer(next, { kind: 'removeDimension', id: newDim.id })
++    expect(evaluate(fixed).solved.ok).toBe(true)
++  })
++
++  it('reports what is free and what is fully defined', () => {
++    const { doc } = buildScenario()
++    const ev = evaluate(doc)
++    // The roof edge line's endpoints can still slide along the edge (its x is free); walls are defined.
++    expect(ev.analysis.dof).toBeGreaterThan(0)
++    const w1 = doc.objects.find((o) => o.kind === 'wall')!
++    const l = doc.lines.find((x) => x.id === (w1 as { line: string }).line)!
++    expect(ev.analysis.definedPoints.has(l.a)).toBe(true)
++    expect(ev.analysis.definedPoints.has(l.b)).toBe(true)
++  })
++
++  it('undo / redo step through the edits', () => {
++    const { doc, ids } = buildScenario()
++    const r = undoable<SketchDoc, SketchAction>(sketchReducer)
++    let h = initHistory(doc)
++    h = r(h, { kind: 'setDimensionValue', id: ids.dLen, value: 12 })
++    expect(pointById(h.present, ids.p2)!.x).toBeCloseTo(12, 6)
++    h = r(h, { kind: 'undo' })
++    expect(pointById(h.present, ids.p2)!.x).toBeCloseTo(10, 6)
++    h = r(h, { kind: 'redo' })
++    expect(pointById(h.present, ids.p2)!.x).toBeCloseTo(12, 6)
++  })
++
++  it('save and reopen keeps objects, dimensions and relations', () => {
++    const { doc, ids } = buildScenario()
++    const json = serializeDoc(doc)
++    const back = parseDoc(json)
++    expect(back.ok).toBe(true)
++    if (!back.ok) return
++    expect(back.doc.objects.length).toBe(doc.objects.length)
++    expect(back.doc.relations.length).toBe(doc.relations.length)
++    expect(back.doc.dimensions.length).toBe(doc.dimensions.length)
++    const ev = evaluate(back.doc)
++    expect(ev.solved.ok).toBe(true)
++    // And still parametric after reopening.
++    const next = sketchReducer(back.doc, { kind: 'setDimensionValue', id: ids.dLen, value: 11 })
++    expect(pointById(next, ids.p2)!.x).toBeCloseTo(11, 6)
++    // Garbage is refused, not silently replaced.
++    expect(restoreDoc({ foo: 1 }).ok).toBe(false)
++    expect(restoreDoc(undefined).ok).toBe(true)
++  })
++
++  it('locking an object pins it: a dimension that must move it conflicts instead of moving it', () => {
++    const { doc, ids } = buildScenario()
++    const locked = sketchReducer(doc, { kind: 'updateObject', id: ids.w2, patch: { locked: true } })
++    const next = sketchReducer(locked, { kind: 'setDimensionValue', id: ids.dLen, value: 12 })
++    expect(pointById(next, ids.p2)!.x).toBeCloseTo(10, 9)
++    expect(evaluate(next).solved.ok).toBe(false)
++  })
++
++  it('divide: three columns evenly between two bounds, following a width change', () => {
++    const { doc, ids } = buildScenario()
++    let next = doc
++    const cols: string[] = []
++    for (const x of [2, 5, 8]) {
++      next = sketchReducer(next, { kind: 'addColumn', at: { x, y: 5 } })
++      cols.push(lastObject(next).id)
++    }
++    next = sketchReducer(next, { kind: 'addRelation', relation: { kind: 'divide', columns: cols, boundA: ids.p4, boundB: ids.p3, by: 'count' } })
++    expect(evaluate(next).solved.ok).toBe(true)
++    const xs = cols.map((id) => pointById(next, (objectById(next, id) as { point: string }).point)!.x)
++    expect(xs[0]).toBeCloseTo(2.5, 5)
++    expect(xs[1]).toBeCloseTo(5, 5)
++    expect(xs[2]).toBeCloseTo(7.5, 5)
++    const wider = sketchReducer(next, { kind: 'setDimensionValue', id: ids.dLen, value: 20 })
++    const xs2 = cols.map((id) => pointById(wider, (objectById(wider, id) as { point: string }).point)!.x)
++    expect(xs2[1]).toBeCloseTo(10, 5)
++    expect(xs2[2]).toBeCloseTo(15, 5)
++    // Removing the relation removes its guide line and leaves the columns free.
++    const rid = next.relations[next.relations.length - 1]!.id
++    const without = sketchReducer(wider, { kind: 'removeRelation', id: rid })
++    expect(without.lines.some((l) => l.id.startsWith(rid))).toBe(false)
++  })
++
++  it('deleting a wall removes its openings and relations but never other objects', () => {
++    const { doc, ids } = buildScenario()
++    const withOpening = sketchReducer(doc, { kind: 'addOpening', wall: ids.w1, offsetM: 3, widthM: 1.2 })
++    const opening = lastObject(withOpening)
++    const next = sketchReducer(withOpening, { kind: 'removeObject', id: ids.w1 })
++    expect(objectById(next, opening.id)).toBeUndefined()
++    expect(next.relations.some((r) => r.id === ids.rCorner)).toBe(false)
++    expect(objectById(next, ids.cCorner)).toBeDefined()
++    expect(objectById(next, ids.beam)).toBeDefined()
++  })
++})
+diff --git a/src/parametric/solver.test.ts b/src/parametric/solver.test.ts
+new file mode 100644
+index 0000000..bc4a311
+--- /dev/null
++++ b/src/parametric/solver.test.ts
+@@ -0,0 +1,163 @@
++import { describe, expect, it } from 'vitest'
++import { analyze } from './analysis'
++import { emptyDoc, type Constraint, type SketchDoc, type SketchLine, type SketchPoint } from './model'
++import { solve } from './solver'
++
++function docWith(points: SketchPoint[], lines: SketchLine[], constraints: Constraint[]): SketchDoc {
++  return { ...emptyDoc(), points, lines, constraints }
++}
++
++const P = (id: string, x: number, y: number): SketchPoint => ({ id, x, y })
++const L = (id: string, a: string, b: string): SketchLine => ({ id, a, b })
++
++/** A 8×6 rectangle: p1(0,0) p2(8,0) p3(8,6) p4(0,6), lines l1..l4. */
++function rectDoc(): SketchDoc {
++  return docWith(
++    [P('p1', 0, 0), P('p2', 8, 0), P('p3', 8, 6), P('p4', 0, 6)],
++    [L('l1', 'p1', 'p2'), L('l2', 'p2', 'p3'), L('l3', 'p3', 'p4'), L('l4', 'p4', 'p1')],
++    [
++      { id: 'c1', kind: 'fixed', p: 'p1', x: 0, y: 0 },
++      { id: 'c2', kind: 'horizontal', line: 'l1' },
++      { id: 'c3', kind: 'vertical', line: 'l2' },
++      { id: 'c4', kind: 'horizontal', line: 'l3' },
++      { id: 'c5', kind: 'vertical', line: 'l4' },
++      { id: 'd1', kind: 'length', line: 'l1', valueM: 8 },
++      { id: 'd2', kind: 'length', line: 'l2', valueM: 6 },
++    ],
++  )
++}
++
++describe('parametric solver', () => {
++  it('a consistent sketch solves with zero residual and keeps positions', () => {
++    const r = solve({ doc: rectDoc() })
++    expect(r.ok).toBe(true)
++    expect(r.points.get('p3')).toEqual({ x: expect.closeTo(8, 6), y: expect.closeTo(6, 6) })
++  })
++
++  it('changing a driving dimension moves the dependent corners and keeps every relation', () => {
++    const d = rectDoc()
++    d.constraints = d.constraints.map((c) => (c.id === 'd1' ? { ...c, valueM: 10 } : c))
++    const r = solve({ doc: d })
++    expect(r.ok).toBe(true)
++    const p2 = r.points.get('p2')!
++    const p3 = r.points.get('p3')!
++    const p4 = r.points.get('p4')!
++    expect(p2.x).toBeCloseTo(10, 6)
++    expect(p2.y).toBeCloseTo(0, 6)
++    expect(p3.x).toBeCloseTo(10, 6)
++    expect(p3.y).toBeCloseTo(6, 6)
++    expect(p4.x).toBeCloseTo(0, 6)
++    expect(p4.y).toBeCloseTo(6, 6)
++  })
++
++  it('a contradicting dimension is reported as a conflict, nothing silently dropped', () => {
++    const d = rectDoc()
++    // l3 is parallel to l1 and spans the same x-range, so its length must be 8.
++    d.constraints.push({ id: 'd3', kind: 'length', line: 'l3', valueM: 9 })
++    const r = solve({ doc: d })
++    expect(r.ok).toBe(false)
++    expect(r.conflicts.length).toBeGreaterThan(0)
++    expect(r.conflicts).toContain('d3')
++    const an = analyze(d, r)
++    expect(an.conflicts).toContain('d3')
++    expect(an.status.get('d3')).toBe('conflict')
++  })
++
++  it('DOF: the fixed+dimensioned rectangle is fully defined, an open sketch is free', () => {
++    const d = rectDoc()
++    const r = solve({ doc: d })
++    const an = analyze(d, r)
++    expect(an.dof).toBe(0)
++    expect(an.freePoints.size).toBe(0)
++    expect(an.definedPoints.size).toBe(4)
++
++    const open = rectDoc()
++    open.constraints = open.constraints.filter((c) => c.id !== 'd2')
++    const r2 = solve({ doc: open })
++    const an2 = analyze(open, r2)
++    expect(an2.dof).toBe(1)
++    expect(an2.freePoints.has('p3')).toBe(true)
++    expect(an2.freePoints.has('p4')).toBe(true)
++    expect(an2.definedPoints.has('p1')).toBe(true)
++    expect(an2.definedPoints.has('p2')).toBe(true)
++  })
++
++  it('a redundant (consistent) constraint is flagged redundant, not conflict', () => {
++    const d = rectDoc()
++    d.constraints.push({ id: 'r1', kind: 'parallel', a: 'l1', b: 'l3' })
++    const r = solve({ doc: d })
++    expect(r.ok).toBe(true)
++    const an = analyze(d, r)
++    expect(an.redundant.length).toBeGreaterThan(0)
++    expect(an.conflicts).toEqual([])
++  })
++
++  it('midpoint + pointOnLine + pointLineDistance keep a column centered and offset', () => {
++    const d = rectDoc()
++    d.points.push(P('c', 3, 1), P('m', 1, 1))
++    d.constraints.push(
++      { id: 'mid', kind: 'midpoint', p: 'm', line: 'l1' },
++      { id: 'cen', kind: 'centered', p: 'c', a: 'l4', b: 'l2' },
++      { id: 'off', kind: 'pointLineDistance', p: 'c', line: 'l1', valueM: 2, offsetM: 0.1 },
++    )
++    const r = solve({ doc: d })
++    expect(r.ok).toBe(true)
++    expect(r.points.get('m')!.x).toBeCloseTo(4, 6)
++    expect(r.points.get('c')!.x).toBeCloseTo(4, 5)
++    expect(r.points.get('c')!.y).toBeCloseTo(2.1, 6)
++    // widen: the column follows the center.
++    d.constraints = d.constraints.map((c) => (c.id === 'd1' ? { ...c, valueM: 12 } : c))
++    const r2 = solve({ doc: d })
++    expect(r2.ok).toBe(true)
++    expect(r2.points.get('c')!.x).toBeCloseTo(6, 5)
++  })
++
++  it('drag: a fully-defined point refuses to follow the cursor; a free one follows', () => {
++    const d = rectDoc()
++    const r = solve({ doc: d, drag: new Map([['p3', { x: 20, y: 20 }]]) })
++    expect(r.ok).toBe(true)
++    expect(r.points.get('p3')!.x).toBeCloseTo(8, 5)
++    const open = rectDoc()
++    open.constraints = open.constraints.filter((c) => c.id !== 'd2')
++    const r2 = solve({ doc: open, drag: new Map([['p3', { x: 8, y: 9 }]]) })
++    expect(r2.ok).toBe(true)
++    expect(r2.points.get('p3')!.y).toBeCloseTo(9, 3)
++    expect(r2.points.get('p4')!.y).toBeCloseTo(9, 3)
++  })
++
++  it('pinned points (locked objects) hold and conflict honestly against a dimension', () => {
++    const d = rectDoc()
++    d.constraints = d.constraints.map((c) => (c.id === 'd1' ? { ...c, valueM: 9 } : c))
++    const r = solve({ doc: d, pinned: new Set(['p2']) })
++    expect(r.ok).toBe(false)
++    expect(r.conflicts).toContain('d1')
++  })
++
++  it('angle, equalLength, symmetric, equalDistance, perpendicular, collinear converge', () => {
++    const d = docWith(
++      [P('a', 0, 0), P('b', 4, 0.2), P('c', 4, 3), P('e', 1, 1), P('f', 3, 1.5), P('g', 2, -1), P('h', 2, 4)],
++      [L('l1', 'a', 'b'), L('l2', 'b', 'c'), L('ax', 'g', 'h'), L('l3', 'e', 'f')],
++      [
++        { id: 'f1', kind: 'fixed', p: 'a', x: 0, y: 0 },
++        { id: 'h1', kind: 'horizontal', line: 'l1' },
++        { id: 'an', kind: 'angle', a: 'l1', b: 'l2', valueDeg: 90 },
++        { id: 'eq', kind: 'equalLength', a: 'l1', b: 'l2' },
++        { id: 'ln', kind: 'length', line: 'l1', valueM: 5 },
++        { id: 'sym', kind: 'symmetric', p: 'e', q: 'f', axis: 'ax' },
++        { id: 'vax', kind: 'vertical', line: 'ax' },
++        { id: 'perp', kind: 'perpendicular', a: 'ax', b: 'l1' },
++        { id: 'ed', kind: 'equalDistance', p: 'a', q: 'g', r: 'g', s: 'b' },
++        { id: 'col', kind: 'pointOnLine', p: 'g', line: 'l1' },
++      ],
++    )
++    const r = solve({ doc: d })
++    expect(r.ok).toBe(true)
++    expect(r.points.get('b')!.x).toBeCloseTo(5, 5)
++    expect(r.points.get('c')!.y).toBeCloseTo(5, 5)
++    expect(r.points.get('g')!.x).toBeCloseTo(2.5, 5)
++    const e = r.points.get('e')!
++    const f = r.points.get('f')!
++    expect((e.x + f.x) / 2).toBeCloseTo(2.5, 5)
++    expect(e.y).toBeCloseTo(f.y, 5)
++  })
++})
+diff --git a/src/parametric/solver.ts b/src/parametric/solver.ts
+new file mode 100644
+index 0000000..6863900
+--- /dev/null
++++ b/src/parametric/solver.ts
+@@ -0,0 +1,432 @@
++// src/parametric/solver.ts
++// NUMERIC CONSTRAINT SOLVER for the parametric sketch (owner brief §1/§4).
++// PURE — no React, no DOM. Levenberg–Marquardt least squares over every
++// point coordinate, with:
++//   - HARD equations from constraints (must reach |r| < tol — a solve that
++//     cannot is a CONFLICT, reported, never patched by dropping a constraint:
++//     brief §4 "לא למחוק או לשנות אילוץ בשקט כדי לפתור סתירה");
++//   - SOFT "stay" terms (tiny weight) so an under-constrained sketch moves
++//     MINIMALLY from where it was — the dimension the user typed changes,
++//     everything else stays put as far as the relations allow;
++//   - optional DRAG targets (medium weight) for interactive dragging: a
++//     fully-defined point simply refuses to follow the cursor.
++// Residual units: meters for distance-like equations; orientation equations
++// use UNIT vectors scaled by SCALE_M so one "meter" of error means roughly
++// the same thing everywhere (conditioning, not physics).
++import type { Constraint, Pt, SketchDoc } from './model'
++import { lineById } from './model'
++import { solveSPD, zeros, type Mat } from './linalg'
++
++export const SOLVE_TOL = 1e-7
++/** Above this a hard equation counts as violated (conflict / not converged). */
++export const CONFLICT_TOL = 1e-5
++const SCALE_M = 1
++const SOFT_W = 1e-4
++const DRAG_W = 0.2
++
++export interface Equation {
++  /** Constraint id this equation belongs to ('pin:<pointId>' for a lock pin). */
++  cid: string
++  /** Variable indices this equation reads (for the sparse numeric Jacobian). */
++  deps: number[]
++  f: (v: Float64Array) => number
++  /** 1 for hard equations; <1 for soft terms (excluded from convergence). */
++  weight: number
++}
++
++export interface CompiledSystem {
++  /** pointId → variable index of x (y is +1). */
++  index: Map<string, number>
++  pointIds: string[]
++  n: number
++  hard: Equation[]
++}
++
++export interface SolveInput {
++  doc: SketchDoc
++  /** Point ids pinned at their current position (locked objects). */
++  pinned?: ReadonlySet<string>
++  /** Interactive drag targets (point id → where the cursor wants it). */
++  drag?: ReadonlyMap<string, Pt>
++  /** Start from these positions instead of doc.points (preview/what-if). */
++  start?: ReadonlyMap<string, Pt>
++}
++
++export interface SolveResult {
++  ok: boolean
++  /** Solved positions (best effort when !ok — callers must NOT commit those). */
++  points: Map<string, Pt>
++  /** Max |residual| per constraint id (hard only). */
++  residuals: Map<string, number>
++  /** Constraint ids whose equations stayed violated (empty when ok). */
++  conflicts: string[]
++  iterations: number
++  system: CompiledSystem
++}
++
++const EMPTY: Pt = { x: 0, y: 0 }
++
++/** Build the hard equations. Exported for the analysis module (Jacobian). */
++export function compile(doc: SketchDoc, pinned?: ReadonlySet<string>): CompiledSystem {
++  const index = new Map<string, number>()
++  const pointIds: string[] = []
++  doc.points.forEach((p, i) => {
++    index.set(p.id, 2 * i)
++    pointIds.push(p.id)
++  })
++  const n = doc.points.length * 2
++  const hard: Equation[] = []
++  const ix = (pid: string): number => {
++    const i = index.get(pid)
++    if (i === undefined) throw new Error(`parametric: unknown point ${pid}`)
++    return i
++  }
++  const lineIx = (lid: string): [number, number] => {
++    const l = lineById(doc, lid)
++    if (!l) throw new Error(`parametric: unknown line ${lid}`)
++    return [ix(l.a), ix(l.b)]
++  }
++  const D = (v: Float64Array, a: number, b: number): Pt => ({ x: v[b]! - v[a]!, y: v[b + 1]! - v[a + 1]! })
++  const U = (d: Pt): Pt => {
++    const l = Math.hypot(d.x, d.y)
++    return l < 1e-12 ? EMPTY : { x: d.x / l, y: d.y / l }
++  }
++  const sdist = (v: Float64Array, p: number, a: number, b: number): number => {
++    const d = D(v, a, b)
++    const l = Math.hypot(d.x, d.y)
++    if (l < 1e-12) return 0
++    const px = v[p]! - v[a]!
++    const py = v[p + 1]! - v[a + 1]!
++    return (d.x * py - d.y * px) / l
++  }
++  const push = (cid: string, deps: number[], f: (v: Float64Array) => number): void => {
++    const set = [...new Set(deps.flatMap((d) => [d, d + 1]))]
++    hard.push({ cid, deps: set, f, weight: 1 })
++  }
++
++  for (const c of doc.constraints) emit(c)
++
++  function emit(c: Constraint): void {
++    switch (c.kind) {
++      case 'horizontal': {
++        const [a, b] = lineIx(c.line)
++        push(c.id, [a, b], (v) => v[b + 1]! - v[a + 1]!)
++        return
++      }
++      case 'vertical': {
++        const [a, b] = lineIx(c.line)
++        push(c.id, [a, b], (v) => v[b]! - v[a]!)
++        return
++      }
++      case 'parallel': {
++        const [a1, a2] = lineIx(c.a)
++        const [b1, b2] = lineIx(c.b)
++        push(c.id, [a1, a2, b1, b2], (v) => {
++          const u = U(D(v, a1, a2))
++          const w = U(D(v, b1, b2))
++          return (u.x * w.y - u.y * w.x) * SCALE_M
++        })
++        return
++      }
++      case 'perpendicular': {
++        const [a1, a2] = lineIx(c.a)
++        const [b1, b2] = lineIx(c.b)
++        push(c.id, [a1, a2, b1, b2], (v) => {
++          const u = U(D(v, a1, a2))
++          const w = U(D(v, b1, b2))
++          return (u.x * w.x + u.y * w.y) * SCALE_M
++        })
++        return
++      }
++      case 'collinear': {
++        const [a1, a2] = lineIx(c.a)
++        const [b1, b2] = lineIx(c.b)
++        push(c.id, [a1, a2, b1], (v) => sdist(v, b1, a1, a2))
++        push(c.id, [a1, a2, b2], (v) => sdist(v, b2, a1, a2))
++        return
++      }
++      case 'equalLength': {
++        const [a1, a2] = lineIx(c.a)
++        const [b1, b2] = lineIx(c.b)
++        push(c.id, [a1, a2, b1, b2], (v) => {
++          const u = D(v, a1, a2)
++          const w = D(v, b1, b2)
++          return Math.hypot(u.x, u.y) - Math.hypot(w.x, w.y)
++        })
++        return
++      }
++      case 'equalAngle': {
++        const [a1, a2] = lineIx(c.a)
++        const [b1, b2] = lineIx(c.b)
++        const [c1, c2] = lineIx(c.c)
++        const [d1, d2] = lineIx(c.d)
++        push(c.id, [a1, a2, b1, b2, c1, c2, d1, d2], (v) => {
++          const ang = (p: Pt, q: Pt): number => Math.atan2(p.x * q.y - p.y * q.x, p.x * q.x + p.y * q.y)
++          const t1 = ang(U(D(v, a1, a2)), U(D(v, b1, b2)))
++          const t2 = ang(U(D(v, c1, c2)), U(D(v, d1, d2)))
++          let d = t1 - t2
++          while (d > Math.PI) d -= 2 * Math.PI
++          while (d < -Math.PI) d += 2 * Math.PI
++          return d * SCALE_M
++        })
++        return
++      }
++      case 'coincident': {
++        const p = ix(c.p)
++        const q = ix(c.q)
++        push(c.id, [p, q], (v) => v[p]! - v[q]!)
++        push(c.id, [p, q], (v) => v[p + 1]! - v[q + 1]!)
++        return
++      }
++      case 'pointOnLine': {
++        const p = ix(c.p)
++        const [a, b] = lineIx(c.line)
++        push(c.id, [p, a, b], (v) => sdist(v, p, a, b))
++        return
++      }
++      case 'midpoint': {
++        const p = ix(c.p)
++        const [a, b] = lineIx(c.line)
++        push(c.id, [p, a, b], (v) => v[p]! - (v[a]! + v[b]!) / 2)
++        push(c.id, [p, a, b], (v) => v[p + 1]! - (v[a + 1]! + v[b + 1]!) / 2)
++        return
++      }
++      case 'symmetric': {
++        const p = ix(c.p)
++        const q = ix(c.q)
++        const [a, b] = lineIx(c.axis)
++        // midpoint of p,q on the axis; p-q perpendicular to the axis.
++        push(c.id, [p, q, a, b], (v) => {
++          const d = D(v, a, b)
++          const l = Math.hypot(d.x, d.y)
++          if (l < 1e-12) return 0
++          const mx = (v[p]! + v[q]!) / 2 - v[a]!
++          const my = (v[p + 1]! + v[q + 1]!) / 2 - v[a + 1]!
++          return (d.x * my - d.y * mx) / l
++        })
++        push(c.id, [p, q, a, b], (v) => {
++          const u = U(D(v, a, b))
++          return ((v[p]! - v[q]!) * u.x + (v[p + 1]! - v[q + 1]!) * u.y)
++        })
++        return
++      }
++      case 'centered': {
++        const p = ix(c.p)
++        const [a1, a2] = lineIx(c.a)
++        const [b1, b2] = lineIx(c.b)
++        push(c.id, [p, a1, a2, b1, b2], (v) => Math.abs(sdist(v, p, a1, a2)) - Math.abs(sdist(v, p, b1, b2)))
++        return
++      }
++      case 'fixed': {
++        const p = ix(c.p)
++        push(c.id, [p], (v) => v[p]! - c.x)
++        push(c.id, [p], (v) => v[p + 1]! - c.y)
++        return
++      }
++      case 'length': {
++        const [a, b] = lineIx(c.line)
++        push(c.id, [a, b], (v) => {
++          const d = D(v, a, b)
++          return Math.hypot(d.x, d.y) - c.valueM
++        })
++        return
++      }
++      case 'pointDistance': {
++        const p = ix(c.p)
++        const q = ix(c.q)
++        push(c.id, [p, q], (v) => Math.hypot(v[p]! - v[q]!, v[p + 1]! - v[q + 1]!) - c.valueM)
++        return
++      }
++      case 'pointLineDistance': {
++        const p = ix(c.p)
++        const [a, b] = lineIx(c.line)
++        const target = c.valueM + (c.offsetM ?? 0)
++        push(c.id, [p, a, b], (v) => sdist(v, p, a, b) - target)
++        return
++      }
++      case 'lineDistance': {
++        const [a1, a2] = lineIx(c.a)
++        const [b1, b2] = lineIx(c.b)
++        const target = c.valueM + (c.offsetM ?? 0)
++        push(c.id, [a1, a2, b1], (v) => sdist(v, b1, a1, a2) - target)
++        push(c.id, [a1, a2, b2], (v) => sdist(v, b2, a1, a2) - target)
++        return
++      }
++      case 'angle': {
++        const [a1, a2] = lineIx(c.a)
++        const [b1, b2] = lineIx(c.b)
++        const targetRad = (c.valueDeg * Math.PI) / 180
++        push(c.id, [a1, a2, b1, b2], (v) => {
++          const u = U(D(v, a1, a2))
++          const w = U(D(v, b1, b2))
++          let d = Math.atan2(u.x * w.y - u.y * w.x, u.x * w.x + u.y * w.y) - targetRad
++          while (d > Math.PI) d -= 2 * Math.PI
++          while (d < -Math.PI) d += 2 * Math.PI
++          return d * SCALE_M
++        })
++        return
++      }
++      case 'equalDistance': {
++        const p = ix(c.p)
++        const q = ix(c.q)
++        const r = ix(c.r)
++        const s = ix(c.s)
++        push(c.id, [p, q, r, s], (v) =>
++          Math.hypot(v[p]! - v[q]!, v[p + 1]! - v[q + 1]!) - Math.hypot(v[r]! - v[s]!, v[r + 1]! - v[s + 1]!),
++        )
++        return
++      }
++    }
++  }
++
++  if (pinned) {
++    for (const pid of pinned) {
++      const i = index.get(pid)
++      if (i === undefined) continue
++      const p0 = doc.points.find((p) => p.id === pid)!
++      push(`pin:${pid}`, [i], (v) => v[i]! - p0.x)
++      push(`pin:${pid}`, [i], (v) => v[i + 1]! - p0.y)
++    }
++  }
++
++  return { index, pointIds, n, hard }
++}
++
++/** Numeric Jacobian row for one equation (central differences on its deps). */
++function jacobianRow(eq: Equation, v: Float64Array, row: Float64Array): void {
++  for (const j of eq.deps) {
++    const x0 = v[j]!
++    const h = 1e-6 * Math.max(1, Math.abs(x0))
++    v[j] = x0 + h
++    const fp = eq.f(v)
++    v[j] = x0 - h
++    const fm = eq.f(v)
++    v[j] = x0
++    row[j] = ((fp - fm) / (2 * h)) * eq.weight
++  }
++}
++
++export function jacobian(eqs: readonly Equation[], v: Float64Array, n: number): Mat {
++  const J = zeros(eqs.length, n)
++  eqs.forEach((eq, i) => jacobianRow(eq, v, J[i]!))
++  return J
++}
++
++function residuals(eqs: readonly Equation[], v: Float64Array): Float64Array {
++  const r = new Float64Array(eqs.length)
++  eqs.forEach((eq, i) => {
++    r[i] = eq.f(v) * eq.weight
++  })
++  return r
++}
++
++function cost(r: Float64Array): number {
++  let s = 0
++  for (const x of r) s += x * x
++  return s
++}
++
++/** One Levenberg–Marquardt run on a fixed equation set. */
++function lm(eqs: readonly Equation[], v: Float64Array, n: number, maxIter: number, tol: number): number {
++  let lambda = 1e-3
++  let r = residuals(eqs, v)
++  let c = cost(r)
++  let iter = 0
++  const hasSoft = eqs.some((eq) => eq.weight !== 1)
++  let lastImprovement = Infinity
++  for (; iter < maxIter; iter++) {
++    let maxHard = 0
++    eqs.forEach((eq, i) => {
++      if (eq.weight === 1) maxHard = Math.max(maxHard, Math.abs(r[i]!))
++    })
++    // Hard equations satisfied: stop — unless soft terms (stay/drag) still
++    // have somewhere to pull, in which case keep going while the cost keeps
++    // dropping meaningfully.
++    if (maxHard < tol && (!hasSoft || lastImprovement < 1e-14 * Math.max(1, c))) break
++    const J = jacobian(eqs, v, n)
++    // Normal equations: (JᵀJ + λ·diag(JᵀJ) + λ·1e-12 I) δ = -Jᵀr
++    const A = zeros(n, n)
++    const g = new Float64Array(n)
++    for (let i = 0; i < eqs.length; i++) {
++      const Ji = J[i]!
++      const ri = r[i]!
++      for (const a of eqs[i]!.deps) {
++        g[a] = g[a]! + Ji[a]! * ri
++        for (const b of eqs[i]!.deps) A[a]![b] = A[a]![b]! + Ji[a]! * Ji[b]!
++      }
++    }
++    let improved = false
++    for (let tries = 0; tries < 12; tries++) {
++      const Ad = A.map((row) => Float64Array.from(row))
++      for (let k = 0; k < n; k++) Ad[k]![k] = Ad[k]![k]! * (1 + lambda) + lambda * 1e-9 + 1e-14
++      const negG = new Float64Array(n)
++      for (let k = 0; k < n; k++) negG[k] = -g[k]!
++      const delta = solveSPD(Ad, negG)
++      if (!delta) {
++        lambda *= 10
++        continue
++      }
++      const vNew = Float64Array.from(v)
++      for (let k = 0; k < n; k++) vNew[k] = vNew[k]! + delta[k]!
++      const rNew = residuals(eqs, vNew)
++      const cNew = cost(rNew)
++      if (cNew < c || cNew < 1e-30) {
++        v.set(vNew)
++        r = rNew
++        lastImprovement = c - cNew
++        c = cNew
++        lambda = Math.max(lambda / 3, 1e-12)
++        improved = true
++        break
++      }
++      lambda *= 5
++    }
++    if (!improved) break
++  }
++  return iter
++}
++
++export function solve(input: SolveInput): SolveResult {
++  const { doc } = input
++  const system = compile(doc, input.pinned)
++  const { n, hard, index, pointIds } = system
++  const v = new Float64Array(n)
++  doc.points.forEach((p, i) => {
++    const s = input.start?.get(p.id)
++    v[2 * i] = s ? s.x : p.x
++    v[2 * i + 1] = s ? s.y : p.y
++  })
++  const v0 = Float64Array.from(v)
++  const pinnedSet = input.pinned ?? new Set<string>()
++
++  // Phase 1: hard + soft stay (+ drag) — finds the nearby solution.
++  const soft: Equation[] = []
++  pointIds.forEach((pid, i) => {
++    if (pinnedSet.has(pid)) return
++    const ixp = 2 * i
++    const target = input.drag?.get(pid)
++    const w = target ? DRAG_W : SOFT_W
++    const tx = target ? target.x : v0[ixp]!
++    const ty = target ? target.y : v0[ixp + 1]!
++    soft.push({ cid: `soft:${pid}`, deps: [ixp], f: (vv) => vv[ixp]! - tx, weight: w })
++    soft.push({ cid: `soft:${pid}`, deps: [ixp + 1], f: (vv) => vv[ixp + 1]! - ty, weight: w })
++  })
++  let iterations = 0
++  if (hard.length > 0) {
++    iterations += lm([...hard, ...soft], v, n, 80, SOLVE_TOL)
++    // Phase 2: polish on the hard set alone (damping → minimum-norm step).
++    iterations += lm(hard, v, n, 40, SOLVE_TOL)
++  } else if (input.drag) {
++    iterations += lm(soft, v, n, 5, SOLVE_TOL)
++  }
++
++  const res = new Map<string, number>()
++  for (const eq of hard) {
++    const r = Math.abs(eq.f(v))
++    res.set(eq.cid, Math.max(res.get(eq.cid) ?? 0, r))
++  }
++  const conflicts = [...res.entries()].filter(([, r]) => r > CONFLICT_TOL).map(([cid]) => cid)
++  const points = new Map<string, Pt>()
++  for (const [pid, i] of index) points.set(pid, { x: v[i]!, y: v[i + 1]! })
++  return { ok: conflicts.length === 0, points, residuals: res, conflicts, iterations, system }
++}
+-- 
+2.43.0
+
